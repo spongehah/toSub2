@@ -1174,6 +1174,50 @@ try {
   });
   assert.equal(emptyQueryResponse.status, 400);
 
+  const resurrectId = "99999999-9999-4999-8999-999999999999";
+  const resurrectEmail = "resurrect-check@example.com";
+  const writeResurrectJob = async () => {
+    const dir = path.join(outputRoot, resurrectId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "sub2api-import-oauth.json"), JSON.stringify({
+      type: "sub2api-data",
+      version: 1,
+      accounts: [{ name: `oauth---${resurrectEmail}`, credentials: { email: resurrectEmail, access_token: "late-write" }, extra: { email: resurrectEmail } }],
+    }));
+    await fs.writeFile(path.join(dir, "job-meta.json"), JSON.stringify({
+      version: 1,
+      email: resurrectEmail,
+      status: "completed",
+      prompt: "授权完成",
+      result_saved: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      login_mode: "password",
+      has_password: true,
+      has_stored_credentials: true,
+    }));
+  };
+  const findResurrectJob = async () => {
+    const response = await fetch(`${baseUrl}/api/jobs/query`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ page: 1, emails: [], search: "resurrect-check" }),
+    });
+    return response.json();
+  };
+  await writeResurrectJob();
+  await delay(2_200);
+  assert.equal((await findResurrectJob()).pagination.total, 1, "新输出目录应被同步导入");
+  const resurrectDeleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [resurrectId] }),
+  });
+  assert.equal(resurrectDeleteResponse.status, 200, await resurrectDeleteResponse.text());
+  await writeResurrectJob();
+  await delay(2_200);
+  assert.equal((await findResurrectJob()).pagination.total, 0, "已删除任务不应被目录回写复活");
+
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",
     headers,

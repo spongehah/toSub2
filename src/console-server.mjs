@@ -66,6 +66,8 @@ const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
+// 已删除任务的 ID 墓碑：防止运行中子进程回写输出文件后，目录同步把任务重新导入
+const deletedJobIds = new Set();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
 let outputSyncPromise = null;
@@ -823,7 +825,7 @@ function scheduleQueuedJobs() {
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
-    if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
+    if (job.deleted || !isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     if (mode === "totp_setup") {
@@ -850,6 +852,8 @@ function enqueueJob(job, mode, startPrompt) {
 }
 
 function launchJob(job, options = {}) {
+  // 已被删除的任务不再启动子进程，避免子进程回写输出目录后任务被重新导入
+  if (job.deleted) return;
   const mode = options.mode || "full";
   if (mode === "full" && !job.authAutomationAttempt) {
     beginAuthorizationAutomationAttempt(job, "login");
@@ -3339,6 +3343,7 @@ async function deleteJobsByEmail(email) {
   const directories = new Set();
   matching.forEach((job) => {
     job.deleted = true;
+    deletedJobIds.add(job.id);
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
@@ -3360,6 +3365,12 @@ function downloadTimestamp(date = new Date()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+function setRestoredJob(id, job) {
+  // 重新导入前再次确认墓碑，避免与删除操作交错时把任务复活
+  if (deletedJobIds.has(id)) return;
+  jobs.set(id, job);
+}
+
 async function syncCompletedOutputs(force = false) {
   if (!force && Date.now() - lastOutputSyncAt < 2_000) return;
   if (outputSyncPromise) return outputSyncPromise;
@@ -3372,7 +3383,7 @@ async function syncCompletedOutputs(force = false) {
       return;
     }
     await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
-      if (jobs.has(entry.name)) return;
+      if (jobs.has(entry.name) || deletedJobIds.has(entry.name)) return;
       const outputDir = path.join(OUTPUT_ROOT, entry.name);
       const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
       const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
@@ -3406,7 +3417,7 @@ async function syncCompletedOutputs(force = false) {
         });
         storedCredentials = totpRecovery.credentials;
         const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery);
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email,
           status: restoredOperation.status,
@@ -3485,7 +3496,7 @@ async function syncCompletedOutputs(force = false) {
         const restoredStatus = passwordRecovery.recovered || totpRecovery.recovered
           ? "resume_available"
           : isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email,
           status: restoredStatus,
@@ -3583,7 +3594,7 @@ async function syncCompletedOutputs(force = false) {
           : interrupted || !savedStatus
             ? metadata.last_error || `上次 ${savedStatus || "未知"} 阶段未完成`
             : metadata.last_error || null;
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email: metadata.email,
           status: restoredStatus,
