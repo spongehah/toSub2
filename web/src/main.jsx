@@ -24,6 +24,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  Search,
   Settings2,
   ShieldCheck,
   Smartphone,
@@ -68,13 +69,14 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const [error, setError] = useState("");
   const [expandedJobId, setExpandedJobId] = useState(null);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
   const [page, setPage] = useState(1);
-  const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
+  const [pagination, setPagination] = useState({ page: 1, pageSize: 100, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
   const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
@@ -144,16 +146,17 @@ function App() {
     let timer;
     const poll = async () => {
       try {
-        const data = emailFilter.length
+        const query = searchQuery.trim();
+        const data = emailFilter.length || query
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, emails: emailFilter, search: query }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
-          setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
+          setPagination(data.pagination || { page, pageSize: 100, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
@@ -169,7 +172,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, searchQuery]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -372,6 +375,30 @@ function App() {
     }
   }
 
+  async function updateSub2ApiSelected(ids) {
+    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
+      openSub2ApiSettings();
+      setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
+      return;
+    }
+    if (batchAction) return;
+    setBatchAction("update");
+    setUploadNotice("");
+    try {
+      const data = await apiFetch(token, "/api/sub2api/update", {
+        method: "POST",
+        body: JSON.stringify({ ids, config: sub2apiSettings }),
+      });
+      setUploadNotice(`已更新 ${data.updated ?? 0} 条${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function loadSmsNumberOptions(settings = smsSettingsDraft) {
     const resolved = resolveSmsProvider(smsProviderDefinitions, settings);
     if (!resolved.definition?.optionsEndpoint) return;
@@ -467,7 +494,7 @@ function App() {
         body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
+      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 100));
       setEmail("");
       setError("");
     } catch (requestError) {
@@ -487,7 +514,7 @@ function App() {
         body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
+      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 100));
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
@@ -717,7 +744,7 @@ function App() {
         <div className="section-heading">
           <div>
             <h2>授权任务</h2>
-            <p>{emailFilter.length
+            <p>{emailFilter.length || searchQuery.trim()
               ? `匹配 ${pagination.total} 条，共 ${pagination.totalAll ?? pagination.total} 条任务`
               : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱后开始第一条任务")}</p>
           </div>
@@ -899,6 +926,12 @@ function App() {
                   上传到 Sub2API
                 </button>
               )}
+              {features.sub2apiUpload && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => updateSub2ApiSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
+                  {batchAction === "update" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+                  更新到 Sub2API
+                </button>
+              )}
               {features.sourceExport && (
                 <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
@@ -935,6 +968,23 @@ function App() {
           </div>
         )}
 
+        <div className="account-search-bar">
+          <Search size={16} aria-hidden="true" />
+          <input
+            type="search"
+            value={searchQuery}
+            onChange={(event) => { setSearchQuery(event.target.value); setPage(1); }}
+            placeholder="模糊搜索账号邮箱"
+            aria-label="搜索账号"
+            spellCheck="false"
+          />
+          {searchQuery && (
+            <button type="button" className="account-search-clear" onClick={() => { setSearchQuery(""); setPage(1); }} title="清除搜索">
+              <X size={15} />
+            </button>
+          )}
+        </div>
+
         <div className="table-frame">
           <table>
             <thead>
@@ -957,7 +1007,7 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
+              {!jobs.length && <EmptyState filtered={emailFilter.length > 0 || Boolean(searchQuery.trim())} />}
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <JobRow
@@ -972,6 +1022,7 @@ function App() {
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
+                    onSub2Update={() => updateSub2ApiSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
@@ -1480,7 +1531,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onSub2Update, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1750,6 +1801,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {job.canDownload && sub2apiUploadAvailable && (
             <button type="button" className="secondary-button" onClick={onUpload} disabled={submitting} title="上传到已配置的 Sub2API 号池">
               <Send size={16} />上传
+            </button>
+          )}
+          {job.canDownload && sub2apiUploadAvailable && (
+            <button type="button" className="secondary-button" onClick={onSub2Update} disabled={submitting} title="按邮箱更新已配置 Sub2API 号池中的账号，远端不存在时失败">
+              <RotateCcw size={16} />更新
             </button>
           )}
           {job.canRegenerate && (

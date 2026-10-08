@@ -15,6 +15,7 @@ const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
 let remoteErrorAccounts = [];
+const accountListQueries = [];
 const updatedRemoteAccounts = new Map();
 const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
@@ -34,6 +35,13 @@ const sub2api = http.createServer(async (req, res) => {
     ]));
     return;
   }
+  if (req.method === "GET" && req.url === "/api/v1/admin/groups/all?platform=composite") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([
+      { id: 9, name: "混合号池", status: "active" },
+    ]));
+    return;
+  }
   if (req.method === "GET" && req.url === "/api/v1/admin/proxies/all") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify([{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }]));
@@ -50,8 +58,13 @@ const sub2api = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
     const requestUrl = new URL(req.url, sub2apiUrl);
+    accountListQueries.push(Object.fromEntries(requestUrl.searchParams));
     const status = requestUrl.searchParams.get("status");
-    const items = remoteErrorAccounts.filter((account) => !status || account.status === status);
+    const group = requestUrl.searchParams.get("group");
+    const items = remoteErrorAccounts.filter((account) => (
+      (!status || account.status === status)
+      && (!group || (account.group_ids || []).map(Number).includes(Number(group)))
+    ));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       code: 0,
@@ -618,6 +631,7 @@ try {
     groups: [
       { id: 7, name: "测试号池", status: "active" },
       { id: 8, name: "备用号池", status: "active" },
+      { id: 9, name: "混合号池", status: "active" },
     ],
     proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
   });
@@ -870,6 +884,10 @@ try {
   const monitorCheck = JSON.parse(monitorCheckText);
   assert.equal(monitorCheck.result.checked, 1);
   assert.equal(monitorCheck.result.started, 1);
+  assert.ok(
+    accountListQueries.some((params) => params.status === "error" && params.group === "7"),
+    "号池巡检必须按勾选分组读取账号",
+  );
   const firstRepair = await waitForJob(
     headers,
     monitorJob.id,
@@ -898,6 +916,60 @@ try {
     existing_setting: "preserved",
     codex_fingerprint_mode: "device",
   });
+
+  const queriesBeforeUpdate = accountListQueries.length;
+  const existingUpdateResponse = await fetch(`${baseUrl}/api/sub2api/update`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [monitorJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7"], codexFingerprintMode: "session" },
+    }),
+  });
+  const existingUpdateText = await existingUpdateResponse.text();
+  assert.equal(existingUpdateResponse.status, 200, existingUpdateText);
+  const existingUpdate = JSON.parse(existingUpdateText);
+  assert.equal(existingUpdate.updated, 1);
+  const updateQueries = accountListQueries.slice(queriesBeforeUpdate);
+  assert.ok(updateQueries.length > 0, "更新操作必须读取远端账号索引");
+  assert.ok(
+    updateQueries.every((params) => params.group === "7" && params.status === undefined),
+    "更新操作必须按勾选分组、不带状态过滤读取账号",
+  );
+  assert.match(updatedRemoteAccounts.get(91).credentials.access_token, /^test-access-password-mail@example\.com$/);
+  assert.deepEqual(updatedRemoteAccounts.get(91).credentials.model_mapping, { "gpt-5": "gpt-5" });
+  assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
+    existing_setting: "preserved",
+    codex_fingerprint_mode: "session",
+  });
+  assert.equal(clearRemoteCounts.get(91), 3);
+  assert.equal(scheduledRemoteAccounts.get(91), true);
+
+  const missingUpdateResponse = await fetch(`${baseUrl}/api/sub2api/update`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7"], codexFingerprintMode: "session" },
+    }),
+  });
+  const missingUpdateText = await missingUpdateResponse.text();
+  assert.equal(missingUpdateResponse.status, 409, missingUpdateText);
+  assert.match(missingUpdateText, /account-profile@example\.com/, "缺少远端账号时必须报出对应邮箱");
+  assert.equal(clearRemoteCounts.get(91), 3, "更新失败时不应改动任何远端账号");
+
+  const duplicateUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [monitorJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "session" },
+    }),
+  });
+  const duplicateUploadText = await duplicateUploadResponse.text();
+  assert.equal(duplicateUploadResponse.status, 200, duplicateUploadText);
+  assert.equal(JSON.parse(duplicateUploadText).result.success, 1, "上传仍走原批量新建逻辑");
+  assert.equal(uploadedAccounts[0].credentials.email, "password-mail@example.com");
 
   const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -1023,6 +1095,25 @@ try {
     (value) => value.status === "failed",
   );
   assert.match(proxyConnectionAlwaysFailed.lastError || "", /连续失败 20 次/);
+
+  const searchResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, emails: [], search: "PROFILE" }),
+  });
+  const searchResponseText = await searchResponse.text();
+  assert.equal(searchResponse.status, 200, searchResponseText);
+  const searchResult = JSON.parse(searchResponseText);
+  assert.equal(searchResult.pagination.total, 1, "模糊搜索应只匹配包含关键词的账号");
+  assert.equal(searchResult.jobs[0].email, "account-profile@example.com");
+  assert.equal(searchResult.filter.search, "profile");
+
+  const emptyQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, emails: [], search: "  " }),
+  });
+  assert.equal(emptyQueryResponse.status, 400);
 
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",

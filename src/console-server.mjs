@@ -27,7 +27,7 @@ const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 100;
 const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
@@ -235,7 +235,10 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    const emailFilter = Array.isArray(body.emails) && body.emails.length ? normalizeEmailFilter(body.emails) : null;
+    const searchQuery = normalizeSearchQuery(body.search);
+    if (!emailFilter && !searchQuery) throw httpError(400, "请至少输入一个筛选邮箱或搜索关键词");
+    await sendJobsPage(res, requestedPage, emailFilter, searchQuery);
     return;
   }
 
@@ -395,33 +398,20 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/groups") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
-    const payload = await requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai");
-    const groups = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
-    sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({
-          id: Number(group.id),
-          name: String(group.name || `号池 ${group.id}`),
-          status: String(group.status || "active"),
-        })),
-    });
+    sendJson(res, 200, { groups: await listSub2ApiGroups(config) });
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/options") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
-    const [groupPayload, proxyPayload] = await Promise.all([
-      requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai"),
+    const [groups, proxyPayload] = await Promise.all([
+      listSub2ApiGroups(config),
       requestSub2Api(config, "/api/v1/admin/proxies/all"),
     ]);
-    const groups = Array.isArray(groupPayload) ? groupPayload : Array.isArray(groupPayload?.data) ? groupPayload.data : [];
     const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
     sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({ id: Number(group.id), name: String(group.name || `号池 ${group.id}`), status: String(group.status || "active") })),
+      groups,
       proxies: proxies
         .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)))
         .map((proxy) => ({
@@ -481,6 +471,50 @@ async function handleApi(req, res, requestUrl) {
       skipped: selected.length - downloadable.length,
       groupIds: config.groupIds,
       result,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/update") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const selected = resolveSelectedJobs(body.ids);
+    const downloadable = selected.filter((job) => job.resultSaved);
+    if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
+    const payload = await buildSub2ApiUploadPayload(downloadable);
+
+    // 按邮箱匹配所选号池中的远端账号；匹配不到直接失败，不会新建账号
+    const remoteAccountsByEmail = await mapSub2ApiAccountsByEmail(config);
+    const missingEmails = [];
+    const updateTargets = [];
+    for (const account of payload.accounts) {
+      const email = sub2ApiAccountEmail(account);
+      const remoteAccounts = email ? remoteAccountsByEmail.get(email) : null;
+      if (!remoteAccounts?.length) {
+        missingEmails.push(email || String(account.name || "").trim() || "未知账号");
+        continue;
+      }
+      if (!account.credentials || typeof account.credentials !== "object") {
+        throw httpError(409, `${email} 的导入文件缺少凭据`);
+      }
+      updateTargets.push({ account, remoteAccounts });
+    }
+    if (missingEmails.length) {
+      throw httpError(409, `以下账号在所选号池中不存在，无法更新：${missingEmails.join("、")}`);
+    }
+
+    let updated = 0;
+    for (const { account, remoteAccounts } of updateTargets) {
+      for (const remoteAccount of remoteAccounts) {
+        if (await updateSub2ApiAccountCredentials(config, remoteAccount, account)) updated += 1;
+      }
+    }
+
+    sendJson(res, 200, {
+      selected: selected.length,
+      updated,
+      skipped: selected.length - downloadable.length,
+      groupIds: config.groupIds,
     });
     return;
   }
@@ -607,13 +641,17 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, searchQuery = "") {
   await syncCompletedOutputs();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
-    ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
-    : allJobs;
+  const search = searchQuery.toLowerCase();
+  const visibleJobs = allJobs.filter((job) => {
+    const email = job.email.toLowerCase();
+    if (emailSet && !emailSet.has(email)) return false;
+    if (search && !email.includes(search)) return false;
+    return true;
+  });
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -622,13 +660,17 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total, search },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
       completed: allJobs.filter((job) => job.status === "completed").length,
     },
   });
+}
+
+function normalizeSearchQuery(value) {
+  return String(value || "").trim().toLowerCase().slice(0, 200);
 }
 
 function normalizeEmailFilter(value) {
@@ -2483,6 +2525,26 @@ async function performSub2ApiRequest(config, endpoint, options = {}) {
   }
 }
 
+async function listSub2ApiGroups(config) {
+  // 内部号池（openai）与混合号池（composite）都可能包含 Codex OAuth 账号，读取时一并返回并按 ID 去重。
+  const platforms = ["openai", "composite"];
+  const payloads = await Promise.all(
+    platforms.map((platform) => requestSub2Api(config, `/api/v1/admin/groups/all?platform=${platform}`)),
+  );
+  const groups = [];
+  const seen = new Set();
+  for (const payload of payloads) {
+    const items = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+    for (const group of items) {
+      const id = Number(group?.id);
+      if (!group || !Number.isInteger(id) || seen.has(id)) continue;
+      seen.add(id);
+      groups.push({ id, name: String(group.name || `号池 ${id}`), status: String(group.status || "active") });
+    }
+  }
+  return groups;
+}
+
 function sub2ApiResponseMessage(payload, text) {
   const message = payload?.error?.message || payload?.message || payload?.error || "";
   return typeof message === "string" && message.trim()
@@ -2754,28 +2816,48 @@ async function getSub2ApiAccount(config, accountId) {
   }
 }
 
-async function listSub2ApiErrorAccounts(config) {
+async function listSub2ApiAccounts(config, { status = "" } = {}) {
+  // 勾选了号池时按每个分组分别查询（接口只支持单个 group 参数），未勾选时读取全部 openai 账号
+  const groupIds = config.groupIds.length ? config.groupIds : [null];
   const accounts = [];
-  let page = 1;
-  let pages = 1;
-  do {
-    const query = new URLSearchParams({
-      page: String(page),
-      page_size: "100",
-      platform: "openai",
-      status: "error",
-    });
-    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
-    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
-    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai" && String(account.status || "error") === "error"));
-    const reportedPages = Number(data?.pages);
-    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
-      ? reportedPages
-      : items.length >= 100 ? page + 1 : page;
-    page += 1;
-  } while (page <= pages && page <= 1_000);
+  const seen = new Set();
+  for (const groupId of groupIds) {
+    const pageSize = 100;
+    let page = 1;
+    let pages = 1;
+    do {
+      const query = new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+        platform: "openai",
+      });
+      if (status) query.set("status", status);
+      if (groupId !== null) query.set("group", String(groupId));
+      const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+      const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+      const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+      for (const account of items) {
+        if (!account || String(account.platform || "openai") !== "openai") continue;
+        const accountId = Number(account.id);
+        if (Number.isSafeInteger(accountId)) {
+          if (seen.has(accountId)) continue;
+          seen.add(accountId);
+        }
+        accounts.push(account);
+      }
+      const reportedPages = Number(data?.pages);
+      pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+        ? reportedPages
+        : items.length >= pageSize ? page + 1 : page;
+      page += 1;
+    } while (page <= pages && page <= 1_000);
+  }
   return accounts;
+}
+
+async function listSub2ApiErrorAccounts(config) {
+  const accounts = await listSub2ApiAccounts(config, { status: "error" });
+  return accounts.filter((account) => String(account.status || "error") === "error");
 }
 
 function sub2ApiAccountEmail(account) {
@@ -2785,6 +2867,18 @@ function sub2ApiAccountEmail(account) {
   if (direct) return direct;
   const match = String(account?.name || "").toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
   return match && isEmail(match[0]) ? match[0] : null;
+}
+
+async function mapSub2ApiAccountsByEmail(config) {
+  // 读取勾选号池（未勾选时读取全部）的 openai 账号，建立 邮箱 -> 远端账号列表 的索引
+  const byEmail = new Map();
+  for (const account of await listSub2ApiAccounts(config)) {
+    const email = sub2ApiAccountEmail(account);
+    if (!email) continue;
+    if (!byEmail.has(email)) byEmail.set(email, []);
+    byEmail.get(email).push(account);
+  }
+  return byEmail;
 }
 
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
@@ -2827,6 +2921,33 @@ function finishSub2ApiAutoRepairSuccess(job) {
   return operationPromise;
 }
 
+async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccount) {
+  const accountId = Number(remoteAccount?.id);
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) return false;
+  // 与号池巡检保持一致：远端已有配置为基础，仅覆盖本地新凭据和 Codex 指纹模式
+  const credentials = {
+    ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
+    ...(localAccount?.credentials && typeof localAccount.credentials === "object" ? localAccount.credentials : {}),
+  };
+  const extra = {
+    ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
+    codex_fingerprint_mode: config.codexFingerprintMode,
+  };
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`, {
+    method: "PUT",
+    body: JSON.stringify({ credentials, extra }),
+  });
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
+    method: "POST",
+    body: "{}",
+  });
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+    method: "POST",
+    body: JSON.stringify({ schedulable: true }),
+  });
+  return true;
+}
+
 async function performSub2ApiAutoRepairSuccess(job) {
   const operation = job.autoRepairOperation;
   if (!operation) return false;
@@ -2841,27 +2962,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
     const pendingIds = new Set(job.autoRepairPendingAccountIds);
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
-      if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
-      const credentials = {
-        ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
-        ...localAccount.credentials,
-      };
-      const extra = {
-        ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
-        codex_fingerprint_mode: operation.config.codexFingerprintMode,
-      };
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
-        method: "PUT",
-        body: JSON.stringify({ credentials, extra }),
-      });
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
-        method: "POST",
-        body: "{}",
-      });
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
-        method: "POST",
-        body: JSON.stringify({ schedulable: true }),
-      });
+      if (!(await updateSub2ApiAccountCredentials(operation.config, remoteAccount, localAccount))) continue;
       pendingIds.delete(accountId);
       job.autoRepairPendingAccountIds = [...pendingIds];
     }

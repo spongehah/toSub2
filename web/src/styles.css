@@ -261,6 +261,34 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 }
 .stop-all-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 
+.account-search-bar {
+  width: min(360px, 100%);
+  min-height: 38px;
+  margin-bottom: 12px;
+  padding: 0 11px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #7b8581;
+  background: #fff;
+  border: 1px solid #cdd5d1;
+  border-radius: 6px;
+}
+.account-search-bar:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.account-search-bar input { width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 13px; }
+.account-search-bar input::placeholder { color: #929b97; }
+.account-search-bar input::-webkit-search-cancel-button { display: none; }
+.account-search-clear {
+  display: grid;
+  place-items: center;
+  padding: 3px;
+  color: #7b8581;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.account-search-clear:hover { color: var(--ink); }
+
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
 table { width: 100%; min-width: 1740px; border-collapse: collapse; table-layout: fixed; }
 th {
@@ -926,6 +954,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .secondary-button { width: 38px; padding: 0; font-size: 0; }
   .add-form .clear-filter-button { grid-column: 1 / -1; justify-self: end; width: auto; font-size: 12px; }
   .selection-toolbar { align-items: stretch; flex-direction: column; }
+  .account-search-bar { width: 100%; }
   .bulk-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .bulk-actions button { width: 100%; padding-right: 6px; padding-left: 6px; }
   .modal-backdrop { padding: 12px; }
