@@ -19,6 +19,8 @@ const interruptedPasswordId = "33333333-3333-4333-8333-333333333333";
 const interruptedPasswordEmail = "restore-password@example.com";
 const interruptedTotpId = "44444444-4444-4444-8444-444444444444";
 const interruptedTotpEmail = "restore-totp@example.com";
+const registeredId = "55555555-5555-4555-8555-555555555555";
+const registeredEmail = "restore-registered@example.com";
 const restoredOperationAt = "2026-08-12T08:30:00.000Z";
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -121,6 +123,20 @@ await fs.writeFile(path.join(interruptedTotpDir, "job-meta.json"), `${JSON.strin
   updated_at: new Date().toISOString(),
   login_checkpoint_available: true,
 }, null, 2)}\n`);
+const registeredDir = path.join(outputRoot, registeredId);
+await fs.mkdir(registeredDir, { recursive: true });
+await fs.writeFile(path.join(registeredDir, "job-meta.json"), `${JSON.stringify({
+  version: 1,
+  email: registeredEmail,
+  status: "registered",
+  prompt: "已登记凭据，等待授权或远端异常时自动登录",
+  result_saved: false,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  login_mode: "email_otp",
+  mail_api_url: "https://mail.example.test/messages/list",
+  awaiting_first_login: true,
+}, null, 2)}\n`);
 
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
@@ -180,6 +196,13 @@ try {
   assert.equal(recoveredTotp.totpSetupError, null);
   assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
   await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  const restoredRegistered = page.jobs.find((job) => job.id === registeredId);
+  assert.equal(restoredRegistered.status, "registered");
+  assert.equal(restoredRegistered.canForceRelogin, true);
+  assert.equal(restoredRegistered.canDownload, false);
+  assert.equal(restoredRegistered.autoRepairEligible, true, restoredRegistered.autoRepairEligibilityReason);
+  assert.match(restoredRegistered.autoRepairEligibilityReason, /尚未验证自动登录/);
+  assert.match(restoredRegistered.prompt, /已登记凭据/);
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

@@ -61,8 +61,10 @@ function App() {
   const [jobs, setJobs] = useState([]);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
+  const [registerOnly, setRegisterOnly] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchText, setBatchText] = useState("");
+  const [batchRegisterOnly, setBatchRegisterOnly] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
@@ -491,7 +493,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), registerOnly }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 100));
@@ -511,7 +513,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), registerOnly: batchRegisterOnly }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 100));
@@ -761,9 +763,18 @@ function App() {
                 required
               />
             </div>
+            <label className="register-only-toggle" title="仅保存登录资料，不立即登录；Sub2API 号池出现异常时自动登录并更新">
+              <input
+                type="checkbox"
+                checked={registerOnly}
+                onChange={(event) => setRegisterOnly(event.target.checked)}
+                disabled={!token}
+              />
+              仅登记
+            </label>
             <button className="primary-button" type="submit" disabled={!token || busy}>
               {busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
-              添加任务
+              {registerOnly ? "登记账号" : "添加任务"}
             </button>
             <button className="secondary-button" type="button" onClick={() => { setBatchError(""); setBatchOpen(true); }} disabled={!token}>
               <ListPlus size={17} />
@@ -1448,7 +1459,7 @@ function App() {
             <div className="dialog-header">
               <div>
                 <h2 id="batch-title">批量添加账号</h2>
-                <span>{countBatchLines(batchText)} 条，超出并发上限后自动排队</span>
+                <span>{countBatchLines(batchText)} 条{batchRegisterOnly ? "，仅登记不立即登录" : "，超出并发上限后自动排队"}</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setBatchOpen(false)} disabled={batchBusy} title="关闭">
                 <X size={18} />
@@ -1470,11 +1481,20 @@ function App() {
               autoFocus
             />
             {batchError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{batchError}</div>}
+            <label className="register-only-toggle batch-register-toggle" title="仅保存登录资料，不立即登录；Sub2API 号池出现异常时自动登录并更新">
+              <input
+                type="checkbox"
+                checked={batchRegisterOnly}
+                onChange={(event) => setBatchRegisterOnly(event.target.checked)}
+                disabled={batchBusy}
+              />
+              仅登记凭据（不立即登录）
+            </label>
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setBatchOpen(false)} disabled={batchBusy}>取消</button>
               <button type="submit" className="primary-button" disabled={!batchText.trim() || batchBusy || countBatchLines(batchText) > 500}>
                 {batchBusy ? <LoaderCircle className="spin" size={17} /> : <ListPlus size={17} />}
-                创建 {countBatchLines(batchText) || ""} 条任务
+                {batchRegisterOnly ? "登记" : "创建"} {countBatchLines(batchText) || ""} 条任务
               </button>
             </div>
           </form>
@@ -1698,7 +1718,10 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <LoginMethodBadge job={job} />
         </div>
       </td>
-      <td><StatusBadge status={job.status} /></td>
+      <td>
+        <StatusBadge status={job.status} />
+        <RepairEligibilityBadge job={job} />
+      </td>
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
@@ -1817,7 +1840,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {forceReloginAvailable && job.canForceRelogin && (
             <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-              重新登录并授权
+              {job.status === "registered" ? "登录并授权" : "重新登录并授权"}
             </button>
           )}
           {totpSetupAvailable && job.canSetupTotp && (
@@ -1900,8 +1923,24 @@ function StatusBadge({ status }) {
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],
     resume_available: ["可继续", <RotateCcw size={14} />],
+    registered: ["已登记", <FileText size={14} />],
   }[status] || [status, null];
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
+}
+
+function RepairEligibilityBadge({ job }) {
+  const visibleStatuses = ["completed", "failed", "canceled", "reauth_required", "resume_available", "registered"];
+  if (!visibleStatuses.includes(job.status)) return null;
+  const eligible = Boolean(job.autoRepairEligible);
+  return (
+    <span
+      className={`repair-badge ${eligible ? "eligible" : "ineligible"}`}
+      title={job.autoRepairEligibilityReason || ""}
+    >
+      {eligible ? <ShieldCheck size={12} /> : <CircleAlert size={12} />}
+      {eligible ? "可自动修复" : "不可自动修复"}
+    </span>
+  );
 }
 
 function LoginMethodBadge({ job }) {

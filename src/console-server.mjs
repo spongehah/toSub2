@@ -266,6 +266,7 @@ async function handleApi(req, res, requestUrl) {
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
+    const registerOnly = body.registerOnly === true;
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
       if (existing) {
@@ -273,7 +274,7 @@ async function handleApi(req, res, requestUrl) {
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
       }
-      return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
+      return { job: await startJob(email, credentials, proxyUrl, { registerOnly }), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -283,13 +284,14 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const registerOnly = body.registerOnly === true;
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
         await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
+      return { job: await startJob(entry.email, entry, proxyUrl, { registerOnly }), updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
@@ -685,7 +687,7 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null) {
+async function startJob(email, credentials = {}, proxyUrl = null, { registerOnly = false } = {}) {
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -700,8 +702,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const job = {
     id,
     email,
-    status: "queued",
-    prompt: "已加入任务队列",
+    status: registerOnly ? "registered" : "queued",
+    prompt: registerOnly ? "已登记凭据，等待授权或远端异常时自动登录" : "已加入任务队列",
     createdAt,
     updatedAt: createdAt,
     lastOperationAt: createdAt,
@@ -737,9 +739,9 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     attempt: 1,
     runId: null,
     runMode: null,
-    queuedMode: "full",
-    queuedAt: new Date().toISOString(),
-    queuedStartPrompt: "正在建立登录会话",
+    queuedMode: registerOnly ? null : "full",
+    queuedAt: registerOnly ? null : new Date().toISOString(),
+    queuedStartPrompt: registerOnly ? null : "正在建立登录会话",
     directTlsFallbackAttempted: false,
     fallbackInProgress: false,
     totpSetupSecret: null,
@@ -761,10 +763,11 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     proxyAttemptParserTail: "",
     queueRunId: null,
     lastAuthAutomated: false,
-    lastAuthAutomationReason: "尚未完成可验证的全自动登录",
+    lastAuthAutomationReason: registerOnly ? "仅登记凭据，尚未完成首次登录" : "尚未完成可验证的全自动登录",
     lastAuthAutomatedAt: null,
     lastAuthRequirements: null,
     authAutomationAttempt: null,
+    awaitingFirstLogin: registerOnly,
     autoRepairBlocked: false,
     autoRepairBlockedReason: null,
     autoRepairBlockedAt: null,
@@ -776,10 +779,10 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     autoRepairOperation: null,
     ...newSmsState(),
   };
-  beginAuthorizationAutomationAttempt(job, "initial");
+  if (!registerOnly) beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
   await saveJobMetadata(job);
-  scheduleQueuedJobs();
+  if (!registerOnly) scheduleQueuedJobs();
   return job;
 }
 
@@ -2901,6 +2904,10 @@ function isAutoRepairCoolingDown(job) {
 
 function getAutoRepairEligibility(job) {
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
+  if (job.awaitingFirstLogin) {
+    if (!job.password && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
+    return { eligible: true, reason: "已登记凭据，尚未验证自动登录；远端异常时将尝试首次自动登录" };
+  }
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
   const requirements = job.lastAuthRequirements || {};
   if (requirements.password && !job.password) return { eligible: false, reason: "已保存的密码无法读取" };
@@ -3127,7 +3134,7 @@ function publicSelectionJob(job) {
 }
 
 function canForceRelogin(job) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "registered"].includes(job.status);
 }
 
 function canSetupTotp(job) {
@@ -3206,6 +3213,7 @@ function completeAuthorizationAutomationAttempt(job) {
   job.lastAuthAutomationReason = reasons.length ? reasons.join("；") : "上次完整登录未需要人工输入密码、邮箱码或登录 2FA";
   job.lastAuthAutomatedAt = new Date().toISOString();
   job.lastAuthRequirements = { ...attempt.requirements };
+  job.awaitingFirstLogin = false;
   job.authAutomationAttempt = null;
   appendJobLog(job, job.lastAuthAutomated
     ? "[automation] 本次完整登录已记录为可自动修复。\n"
@@ -3272,7 +3280,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(status);
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "registered"].includes(status);
 }
 
 function uniqueByJson(items) {
@@ -3897,6 +3905,7 @@ function restoredAutoRepairState(metadata = {}) {
     lastAuthAutomated: metadata.last_auth_automated === true,
     lastAuthAutomationReason: String(metadata.last_auth_automation_reason || "旧任务没有自动化参与记录"),
     lastAuthAutomatedAt: metadata.last_auth_automated_at || null,
+    awaitingFirstLogin: metadata.awaiting_first_login === true,
     lastAuthRequirements: requirements && typeof requirements === "object"
       ? {
           password: Boolean(requirements.password),
@@ -4457,6 +4466,7 @@ async function saveJobMetadata(job) {
         last_auth_automation_reason: job.lastAuthAutomationReason || null,
         last_auth_automated_at: job.lastAuthAutomatedAt || null,
         last_auth_requirements: job.lastAuthRequirements || null,
+        awaiting_first_login: Boolean(job.awaitingFirstLogin),
         auto_repair_blocked: Boolean(job.autoRepairBlocked),
         auto_repair_blocked_reason: job.autoRepairBlockedReason || null,
         auto_repair_blocked_at: job.autoRepairBlockedAt || null,

@@ -702,6 +702,40 @@ try {
   });
   assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
 
+  const registeredCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "registered-auto@example.com", password: "registered-password", registerOnly: true }),
+  });
+  const registeredCreateText = await registeredCreateResponse.text();
+  assert.equal(registeredCreateResponse.status, 201, registeredCreateText);
+  const registeredJob = JSON.parse(registeredCreateText).job;
+  assert.equal(registeredJob.status, "registered");
+  assert.equal(registeredJob.autoRepairEligible, true, registeredJob.autoRepairEligibilityReason);
+
+  const registeredNoCredsResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "registered-nocreds@example.com", registerOnly: true }),
+  });
+  const registeredNoCredsText = await registeredNoCredsResponse.text();
+  assert.equal(registeredNoCredsResponse.status, 201, registeredNoCredsText);
+  const registeredNoCredsJob = JSON.parse(registeredNoCredsText).job;
+  assert.equal(registeredNoCredsJob.status, "registered");
+  assert.equal(registeredNoCredsJob.autoRepairEligible, false);
+  assert.match(registeredNoCredsJob.autoRepairEligibilityReason, /缺少可自动登录的密码或邮件收码 API/);
+
+  await delay(400);
+  const registeredStillResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, emails: [], search: "registered-auto" }),
+  });
+  const registeredStillText = await registeredStillResponse.text();
+  assert.equal(registeredStillResponse.status, 200, registeredStillText);
+  const registeredStill = JSON.parse(registeredStillText).jobs[0];
+  assert.equal(registeredStill.status, "registered", "仅登记任务不应自动发起登录");
+
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,
@@ -971,6 +1005,31 @@ try {
   assert.equal(JSON.parse(duplicateUploadText).result.success, 1, "上传仍走原批量新建逻辑");
   assert.equal(uploadedAccounts[0].credentials.email, "password-mail@example.com");
 
+  remoteErrorAccounts = [{
+    id: 94,
+    name: "oauth---registered-auto@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "refresh token expired",
+    credentials: { email: "registered-auto@example.com" },
+    group_ids: [7],
+  }];
+  const registeredMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const registeredMonitorText = await registeredMonitorResponse.text();
+  assert.equal(registeredMonitorResponse.status, 200, registeredMonitorText);
+  assert.equal(JSON.parse(registeredMonitorText).result.started, 1, "已登记账号应触发首次自动登录");
+  const registeredRepaired = await waitForJob(
+    headers,
+    registeredJob.id,
+    (value) => value.status === "completed" && value.autoRepairLastSuccessAt && !value.autoRepairLastError,
+  );
+  assert.equal(registeredRepaired.autoRepairEligible, true, registeredRepaired.autoRepairEligibilityReason);
+  assert.match(updatedRemoteAccounts.get(94).credentials.access_token, /^test-access-registered-auto@example\.com$/);
+
   const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -1134,13 +1193,15 @@ try {
       phoneFallbackJobId,
       incompleteAuthorizationId,
       incompleteTotpId,
+      registeredJob.id,
+      registeredNoCredsJob.id,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 29);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
