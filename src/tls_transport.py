@@ -43,10 +43,10 @@ class Worker:
     def __init__(self):
         self.session = None
         self.proxy = None
-        self.impersonate = "chrome146"
+        self.impersonate = "chrome150"
         self.verify_tls = True
         self.sentinel_client = None
-        self.fallback_profiles = ("chrome146", "chrome145", "chrome142", "chrome136")
+        self.fallback_profiles = ("chrome150", "chrome146", "chrome145", "chrome142", "chrome136")
 
     def configure(self, proxy, impersonate, allow_fallback=True, verify_tls=True):
         if IMPORT_ERROR:
@@ -60,7 +60,7 @@ class Worker:
             self.session = None
         self.proxy = proxy or None
         self.verify_tls = bool(verify_tls)
-        requested_profile = impersonate or "chrome146"
+        requested_profile = impersonate or "chrome150"
         profiles = [requested_profile]
         if allow_fallback:
             profiles.extend(

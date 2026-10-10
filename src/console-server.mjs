@@ -16,12 +16,12 @@ import {
   validateMailApiUrl,
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
-import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { DirectTlsProfileProbe, proxySupportsSessionRotation, TlsFingerprintTransport } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
-const DEFAULT_TLS_PROFILE = "chrome146";
+const DEFAULT_TLS_PROFILE = "chrome150";
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
@@ -63,6 +63,9 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const TLS_PROFILE_SETTING_FILENAME = "tls-profile.json";
+const TLS_PROFILE_SETTING_PATH = path.join(OUTPUT_ROOT, TLS_PROFILE_SETTING_FILENAME);
+let tlsProfileSetting = null;
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -118,6 +121,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadTlsProfileConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
@@ -253,6 +257,38 @@ async function handleApi(req, res, requestUrl) {
         urlConfigured: Boolean(mailRequestConfig.url),
         headerCount: Object.keys(mailRequestConfig.headers).length,
       },
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxy-check") {
+    const body = await readJson(req);
+    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    if (!proxyUrl) throw httpError(400, "请先填写代理地址");
+    const solver = body.solver === true;
+    const results = await runProxyCheck(proxyUrl, { solver });
+    sendJson(res, 200, { solver, results });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/tls-profile") {
+    sendJson(res, 200, {
+      profile: tlsProfileSetting || "",
+      effective: effectiveTlsProfile(),
+      env: String(process.env.TOSUB2_TLS_PROFILE || "").trim() || null,
+      defaultProfile: DEFAULT_TLS_PROFILE,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/tls-profile") {
+    const body = await readJson(req);
+    tlsProfileSetting = normalizeTlsProfileSetting(body.profile) || null;
+    syncDirectTlsProfileProbe();
+    await persistTlsProfileConfiguration();
+    sendJson(res, 200, {
+      profile: tlsProfileSetting || "",
+      effective: effectiveTlsProfile(),
     });
     return;
   }
@@ -916,9 +952,7 @@ function launchJob(job, options = {}) {
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
-      TOSUB2_TLS_PROFILE:
-        String(process.env.TOSUB2_TLS_PROFILE || "").trim()
-        || (!job.proxyUrl ? String(options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
+      TOSUB2_TLS_PROFILE: effectiveTlsProfile(),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -2559,6 +2593,51 @@ function sub2ApiResponseMessage(payload, text) {
     : extractResponseMessage(text);
 }
 
+function normalizeTlsProfileSetting(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text || text === "default") return "";
+  if (text === "auto" || /^chrome\d+[a-z]?$/.test(text)) return text;
+  throw httpError(400, "TLS 指纹格式不正确，应为 auto、chromeNNN，或留空使用默认指纹");
+}
+
+function effectiveTlsProfile() {
+  return tlsProfileSetting || String(process.env.TOSUB2_TLS_PROFILE || "").trim() || DEFAULT_TLS_PROFILE;
+}
+
+function syncDirectTlsProfileProbe() {
+  const runtime = tlsProfileSetting && tlsProfileSetting !== "auto" ? tlsProfileSetting : null;
+  const env = String(process.env.TOSUB2_TLS_PROFILE || "").trim();
+  directTlsProfileProbe.profile = runtime || (env && env !== "auto" ? env : null);
+}
+
+async function loadTlsProfileConfiguration() {
+  try {
+    const saved = JSON.parse(await fs.readFile(TLS_PROFILE_SETTING_PATH, "utf8"));
+    tlsProfileSetting = normalizeTlsProfileSetting(saved.profile) || null;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] TLS 指纹配置无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+    tlsProfileSetting = null;
+  }
+  syncDirectTlsProfileProbe();
+}
+
+async function persistTlsProfileConfiguration() {
+  if (!tlsProfileSetting) {
+    await fs.rm(TLS_PROFILE_SETTING_PATH, { force: true });
+    return;
+  }
+  const payload = {
+    version: 1,
+    profile: tlsProfileSetting,
+    updated_at: new Date().toISOString(),
+  };
+  const tempPath = `${TLS_PROFILE_SETTING_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(tempPath, TLS_PROFILE_SETTING_PATH);
+}
+
 async function loadSub2ApiMonitorConfiguration() {
   try {
     const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
@@ -3849,6 +3928,89 @@ function normalizeProxyUrl(value) {
     throw httpError(400, "账号代理只支持 http、https、socks5 和 socks5h 协议");
   }
   return parsed.toString();
+}
+
+const PROXY_CHECK_PROFILES = ["chrome150", "chrome146", "chrome145", "chrome142", "chrome136"];
+
+const EXIT_IP_ENDPOINTS = [
+  {
+    // Cloudflare 自己的 trace 端点就在 chatgpt.com 域名下，受限代理也能访问，还能带出地区/机房
+    url: (chatgptBase) => `${chatgptBase}/cdn-cgi/trace`,
+    parse: (text) => {
+      const ip = /(?:^|\n)ip=([0-9a-fA-F:.]{3,45})/.exec(text)?.[1] || null;
+      if (!ip) return null;
+      return {
+        ip,
+        loc: /(?:^|\n)loc=([A-Z]{2})/.exec(text)?.[1] || null,
+        colo: /(?:^|\n)colo=([A-Za-z0-9]{3})/.exec(text)?.[1] || null,
+      };
+    },
+  },
+  { url: () => "https://api.ipify.org", parse: (text) => (/^[0-9a-fA-F:.]{3,45}$/.test(text) ? { ip: text, loc: null, colo: null } : null) },
+  { url: () => "https://ifconfig.me/ip", parse: (text) => (/^[0-9a-fA-F:.]{3,45}$/.test(text) ? { ip: text, loc: null, colo: null } : null) },
+  { url: () => "https://ipinfo.io/ip", parse: (text) => (/^[0-9a-fA-F:.]{3,45}$/.test(text) ? { ip: text, loc: null, colo: null } : null) },
+];
+
+async function fetchProxyExitInfo(transport, chatgptBase) {
+  let lastError = null;
+  for (const endpoint of EXIT_IP_ENDPOINTS) {
+    try {
+      const response = await transport.request("GET", endpoint.url(chatgptBase), { timeoutMs: 15_000 });
+      if (response.status !== 200) {
+        lastError = `HTTP ${response.status}`;
+        continue;
+      }
+      const parsed = endpoint.parse((await response.text()).trim());
+      if (parsed) return { ...parsed, error: null };
+      lastError = "返回内容无法解析";
+    } catch (error) {
+      lastError = String(error?.message || error).trim().slice(0, 200);
+    }
+  }
+  return { ip: null, loc: null, colo: null, error: lastError || "获取失败" };
+}
+
+async function runProxyCheck(proxyUrl, { solver = false } = {}) {
+  // 快速模式：不启用过盾，逐个指纹探测是否被 Cloudflare 挑战；开启过盾时只测默认指纹（较慢）
+  const chatgptBase = String(process.env.CHATGPT_BASE || "https://chatgpt.com").replace(/\/$/, "");
+  const defaultProfile = effectiveTlsProfile();
+  const profiles = solver ? [defaultProfile] : PROXY_CHECK_PROFILES;
+  const results = [];
+  for (const profile of profiles) {
+    const transport = new TlsFingerprintTransport({
+      enabled: true,
+      profile,
+      cloudflareSolver: Boolean(solver),
+    });
+    const startedAt = Date.now();
+    let ok = false;
+    let message = "";
+    let probeMs = 0;
+    try {
+      await transport.prepareProxy(proxyUrl, `${chatgptBase}/`);
+      ok = true;
+      message = "通过";
+    } catch (error) {
+      message = String(error?.message || error).trim().slice(0, 300) || "检测失败";
+    }
+    probeMs = Date.now() - startedAt;
+    const exit = transport.hasConfiguredProxy()
+      ? await fetchProxyExitInfo(transport, chatgptBase)
+      : { ip: null, loc: null, colo: null, error: "代理未成功配置" };
+    await transport.close();
+    results.push({
+      profile: String(transport.profile || profile),
+      ok,
+      message,
+      exitIp: exit.ip || null,
+      exitLoc: exit.loc || null,
+      exitColo: exit.colo || null,
+      exitIpError: exit.error || null,
+      elapsedMs: Date.now() - startedAt,
+      probeMs,
+    });
+  }
+  return results;
 }
 
 function normalizeLoginCredentials(value = {}) {

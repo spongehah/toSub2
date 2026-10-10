@@ -201,7 +201,7 @@ try {
       solveOperations += 1;
       assert.equal(message.url, "https://chatgpt.com/");
       assert.match(Buffer.from(message.challengeBody, "base64").toString("utf8"), /_cf_chl_opt/);
-      assert.match(message.userAgent, /Chrome\/146/);
+      assert.equal(message.userAgent, browserIdentityForTlsProfile(solvedChallenge.profile).userAgent);
       assert.equal(message.browserIdentity.platform, "MacIntel");
       assert.equal(message.browserIdentity.locale, "zh-CN");
       assert.equal(message.browserIdentity.languages[0], "zh-CN");
@@ -329,15 +329,15 @@ class FakeRequests:
     @classmethod
     def Session(cls, impersonate, proxy):
         cls.attempts.append(impersonate)
-        if impersonate == "chrome146":
-            raise RuntimeError("Impersonating chrome146 is not supported")
+        if impersonate in ("chrome150", "chrome146"):
+            raise RuntimeError(f"Impersonating {impersonate} is not supported")
         return FakeSession()
 
 module.requests = FakeRequests
 worker = module.Worker()
 worker.configure(None, "chrome146")
 assert worker.impersonate == "chrome145", worker.impersonate
-assert FakeRequests.attempts[:2] == ["chrome146", "chrome145"], FakeRequests.attempts
+assert FakeRequests.attempts[:3] == ["chrome146", "chrome150", "chrome145"], FakeRequests.attempts
 `;
   const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
     encoding: "utf8",
@@ -545,7 +545,7 @@ worker = module.Worker()
 result = worker.probe_profiles("https://chatgpt.com/", ["chrome146", "chrome142"], 1000)
 assert result == {"profile": "chrome142", "attempts": 2}, result
 assert worker.impersonate == "chrome142"
-assert FakeRequests.attempts == ["chrome146", "chrome142"]
+assert sorted(FakeRequests.attempts) == sorted(["chrome146", "chrome142"]), FakeRequests.attempts
 FakeRequests.attempts = []
 bounded = module.Worker().probe_profiles(
     "https://chatgpt.com/",
@@ -554,9 +554,20 @@ bounded = module.Worker().probe_profiles(
     80,
 )
 assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
-assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
+assert sorted(FakeRequests.attempts) == sorted(["chrome146", "chrome142", "chrome141", "chrome140"]), FakeRequests.attempts
 profiles = worker._supported_chrome_profiles()
-assert profiles[0] == "chrome146", profiles
+from curl_cffi.requests.impersonate import BrowserTypeLiteral
+from typing import get_args
+import re as _re
+_chrome_profiles = [
+    value for value in get_args(BrowserTypeLiteral)
+    if isinstance(value, str) and _re.fullmatch(r"chrome\d+[a-z]?", value)
+]
+_newest = max(
+    _chrome_profiles,
+    key=lambda p: (int(_re.fullmatch(r"chrome(\d+)([a-z]?)", p).group(1)), _re.fullmatch(r"chrome(\d+)([a-z]?)", p).group(2)),
+)
+assert profiles[0] == _newest, profiles
 assert "chrome142" in profiles
 assert "chrome131_android" not in profiles
 assert "chrome" not in profiles

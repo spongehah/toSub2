@@ -137,6 +137,11 @@ await fs.writeFile(path.join(registeredDir, "job-meta.json"), `${JSON.stringify(
   mail_api_url: "https://mail.example.test/messages/list",
   awaiting_first_login: true,
 }, null, 2)}\n`);
+await fs.writeFile(path.join(outputRoot, "tls-profile.json"), `${JSON.stringify({
+  version: 1,
+  profile: "chrome136",
+  updated_at: new Date().toISOString(),
+}, null, 2)}\n`);
 
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
@@ -165,6 +170,9 @@ const childExit = new Promise((resolve) => child.once("exit", (code, signal) => 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
+  const tlsProfileState = await fetch(`${baseUrl}/api/tls-profile`, { headers }).then((response) => response.json());
+  assert.equal(tlsProfileState.profile, "chrome136", "重启后应恢复运行时配置的指纹");
+  assert.equal(tlsProfileState.effective, "chrome136", "运行时配置应覆盖环境变量指纹");
   const page = await fetch(`${baseUrl}/api/jobs`, { headers }).then((response) => response.json());
   const restored = page.jobs.find((job) => job.id === restoredId);
   assert.equal(restored.status, "failed");

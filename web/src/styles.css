@@ -102,6 +102,19 @@ button { letter-spacing: 0; }
 .provider-field.service-field { width: 160px; }
 .account-proxy-input { width: min(270px, 28vw); min-width: 0; }
 .account-proxy-field { width: 100%; }
+.tls-profile-input { width: fit-content; min-width: 0; }
+.tls-profile-field { width: auto; }
+.tls-profile-field select {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tls-profile-field select:disabled { cursor: not-allowed; opacity: .6; }
 .provider-ready { display: inline-flex; align-items: center; gap: 4px; color: var(--green-strong); font-size: 11px; font-weight: 700; }
 .provider-ready.incomplete { color: var(--amber); }
 .provider-external-link {
@@ -122,6 +135,7 @@ button { letter-spacing: 0; }
 .sub2api-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .monitor-ready { padding-left: 8px; border-left: 1px solid var(--line); }
 .monitor-check-button { width: 34px; height: 34px; }
+.proxy-check-button { height: 34px; }
 
 .add-form { display: flex; gap: 8px; }
 .register-only-toggle {
@@ -862,6 +876,47 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .batch-dialog .sub2api-model-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .dialog-hint { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+
+.proxy-check-dialog { width: min(620px, calc(100vw - 32px)); }
+.proxy-check-solver { margin: 2px 0 10px; }
+.proxy-check-progress {
+  padding: 10px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.proxy-check-list {
+  max-height: 340px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.proxy-check-item {
+  padding: 9px 11px;
+  background: #fafbfa;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.proxy-check-item.ok { background: #f4fbf7; border-color: #bfe4d2; }
+.proxy-check-item.bad { background: #fdf7f7; border-color: #f1c7c7; }
+.proxy-check-item-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: #44504c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.proxy-check-item-head svg { flex: 0 0 auto; margin-top: 1px; }
+.proxy-check-item-head strong { white-space: nowrap; }
+.proxy-check-item.ok .proxy-check-item-head svg { color: var(--green-strong); }
+.proxy-check-item.bad .proxy-check-item-head svg { color: var(--danger); }
+.proxy-check-item-head span { overflow-wrap: anywhere; }
+.proxy-check-apply { margin-left: auto; white-space: nowrap; }
+.proxy-check-item small { margin-top: 4px; display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .sub2api-monitor-status {
   margin-top: 10px;
   padding: 9px 10px;
@@ -983,7 +1038,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .section-heading { align-items: stretch; flex-direction: column; gap: 14px; }
   .provider-toolbar { align-items: stretch; flex-direction: column; }
   .provider-heading { margin-right: 0; }
-  .provider-field, .provider-field.service-field, .account-proxy-input, .account-proxy-field { width: 100%; }
+  .provider-field, .provider-field.service-field, .account-proxy-input, .account-proxy-field, .tls-profile-input, .tls-profile-field { width: 100%; }
   .provider-settings-button { width: 100%; margin-left: 0; }
   .add-form { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto 38px 38px; }
   .add-form .register-only-toggle { grid-column: 1 / -1; justify-self: start; }

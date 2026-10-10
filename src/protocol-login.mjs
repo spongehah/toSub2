@@ -56,7 +56,7 @@ function userAgentForTransport(transport) {
 }
 
 function browserIdentityForTransport(transport) {
-  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || "chrome146");
+  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || "chrome150");
 }
 
 function browserHeadersForTransport(transport) {
@@ -297,7 +297,7 @@ async function run() {
     profile:
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
-      || "chrome146",
+      || "chrome150",
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
@@ -2377,7 +2377,7 @@ Options:
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
   --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
-  --tls-profile <name>            curl_cffi browser profile. Default: chrome146; use auto to enable probing
+  --tls-profile <name>            curl_cffi browser profile. Default: chrome150; use auto to enable probing
   --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}

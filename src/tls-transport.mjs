@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, "tls_transport.py");
-const DEFAULT_PROFILE = "chrome146";
+const DEFAULT_PROFILE = "chrome150";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_PROBE_TIMEOUT_MS = 15_000;
 const PROFILE_PROBE_TOTAL_TIMEOUT_MS = 300_000;
@@ -17,7 +17,7 @@ const UNCONFIGURED = Symbol("unconfigured");
 
 export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
   const normalizedProfile = String(profile || DEFAULT_PROFILE).trim();
-  const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 146);
+  const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 150);
   const usesMacOs = majorVersion >= 119;
   const platformToken = usesMacOs
     ? "Macintosh; Intel Mac OS X 10_15_7"

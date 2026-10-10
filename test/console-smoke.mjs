@@ -736,6 +736,55 @@ try {
   const registeredStill = JSON.parse(registeredStillText).jobs[0];
   assert.equal(registeredStill.status, "registered", "仅登记任务不应自动发起登录");
 
+  const proxyCheckMissingResponse = await fetch(`${baseUrl}/api/proxy-check`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({}),
+  });
+  assert.equal(proxyCheckMissingResponse.status, 400);
+
+  const proxyCheckInvalidResponse = await fetch(`${baseUrl}/api/proxy-check`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proxyUrl: "not-a-url" }),
+  });
+  assert.equal(proxyCheckInvalidResponse.status, 400);
+
+  const tlsProfileInitialResponse = await fetch(`${baseUrl}/api/tls-profile`, { headers });
+  const tlsProfileInitialText = await tlsProfileInitialResponse.text();
+  assert.equal(tlsProfileInitialResponse.status, 200, tlsProfileInitialText);
+  const tlsProfileInitial = JSON.parse(tlsProfileInitialText);
+  assert.equal(tlsProfileInitial.profile, "");
+  assert.equal(tlsProfileInitial.effective, "chrome142", "未显式配置时应使用环境变量指纹");
+
+  const tlsProfileInvalidResponse = await fetch(`${baseUrl}/api/tls-profile`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ profile: "safari" }),
+  });
+  assert.equal(tlsProfileInvalidResponse.status, 400);
+
+  const tlsProfileSetResponse = await fetch(`${baseUrl}/api/tls-profile`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ profile: "chrome146" }),
+  });
+  const tlsProfileSetText = await tlsProfileSetResponse.text();
+  assert.equal(tlsProfileSetResponse.status, 200, tlsProfileSetText);
+  assert.equal(JSON.parse(tlsProfileSetText).effective, "chrome146");
+  const tlsProfileAfter = await (await fetch(`${baseUrl}/api/tls-profile`, { headers })).json();
+  assert.equal(tlsProfileAfter.profile, "chrome146");
+  assert.equal(tlsProfileAfter.effective, "chrome146", "运行时配置应覆盖环境变量");
+
+  const tlsProfileResetResponse = await fetch(`${baseUrl}/api/tls-profile`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ profile: "" }),
+  });
+  const tlsProfileResetText = await tlsProfileResetResponse.text();
+  assert.equal(tlsProfileResetResponse.status, 200, tlsProfileResetText);
+  assert.equal(JSON.parse(tlsProfileResetText).effective, "chrome142", "清空后应回到环境变量指纹");
+
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,

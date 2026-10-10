@@ -13,6 +13,7 @@ import {
   ExternalLink,
   FileText,
   Filter,
+  Fingerprint,
   Globe2,
   KeyRound,
   ListPlus,
@@ -112,6 +113,16 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const [proxyCheckOpen, setProxyCheckOpen] = useState(false);
+  const [proxyChecking, setProxyChecking] = useState(false);
+  const [proxyCheckSolver, setProxyCheckSolver] = useState(false);
+  const [proxyCheckError, setProxyCheckError] = useState("");
+  const [proxyCheckResults, setProxyCheckResults] = useState([]);
+  const [tlsProfile, setTlsProfile] = useState("");
+  const [tlsProfileEffective, setTlsProfileEffective] = useState("");
+  const [tlsProfileDefault, setTlsProfileDefault] = useState("chrome150");
+  const [tlsProfileEnv, setTlsProfileEnv] = useState(null);
+  const [tlsProfileSaving, setTlsProfileSaving] = useState(false);
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
@@ -195,6 +206,18 @@ function App() {
       window.clearInterval(timer);
     };
   }, [token, features.sub2apiMonitor]);
+
+  useEffect(() => {
+    if (!token) return;
+    void apiFetch(token, "/api/tls-profile")
+      .then((data) => {
+        setTlsProfile(data.profile || "");
+        setTlsProfileEffective(data.effective || "");
+        setTlsProfileDefault(data.defaultProfile || "chrome150");
+        setTlsProfileEnv(data.env || null);
+      })
+      .catch(() => {});
+  }, [token]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
@@ -725,6 +748,49 @@ function App() {
     }
   }
 
+  async function checkAccountProxy() {
+    const proxyUrl = accountProxyUrl.trim();
+    if (!proxyUrl) {
+      setError("请先填写代理地址");
+      return;
+    }
+    if (proxyChecking) return;
+    setProxyChecking(true);
+    setProxyCheckError("");
+    setProxyCheckResults([]);
+    setProxyCheckOpen(true);
+    try {
+      const data = await apiFetch(token, "/api/proxy-check", {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl, solver: proxyCheckSolver }),
+      });
+      setProxyCheckResults(Array.isArray(data.results) ? data.results : []);
+    } catch (requestError) {
+      setProxyCheckError(requestError.message);
+    } finally {
+      setProxyChecking(false);
+    }
+  }
+
+  async function updateTlsProfile(profile) {
+    if (tlsProfileSaving) return;
+    setTlsProfileSaving(true);
+    try {
+      const data = await apiFetch(token, "/api/tls-profile", {
+        method: "POST",
+        body: JSON.stringify({ profile }),
+      });
+      setTlsProfile(data.profile || "");
+      setTlsProfileEffective(data.effective || "");
+      setError("");
+      setUploadNotice(`TLS 指纹已切换为 ${data.effective}，新任务和重试立即生效`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setTlsProfileSaving(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -878,6 +944,16 @@ function App() {
             {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
             {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
           </span>
+          <button
+            type="button"
+            className="secondary-button proxy-check-button"
+            onClick={checkAccountProxy}
+            disabled={!token || !accountProxyUrl.trim() || proxyChecking}
+            title="用与登录相同的链路检测代理出口，并按 TLS 指纹逐个对比"
+          >
+            {proxyChecking ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+            {proxyChecking ? "检测中" : "检测出口"}
+          </button>
           <a
             className="provider-external-link"
             href="https://invite.zooproxy.com/share/ez2v2jdb7"
@@ -887,6 +963,34 @@ function App() {
             <ExternalLink size={13} aria-hidden="true" />
             点击获取代理 IP
           </a>
+        </div>
+
+        <div className="provider-toolbar tls-profile-toolbar" aria-label="TLS 指纹配置">
+          <div className="provider-heading"><Fingerprint size={17} /><strong>TLS 指纹</strong></div>
+          <div className="tls-profile-input">
+            <label className="provider-field tls-profile-field" title="控制协议登录使用的 Chrome TLS 指纹；切换后对新任务和重试立即生效，无需重启">
+              <Fingerprint size={15} aria-hidden="true" />
+              <select
+                value={tlsProfile}
+                onChange={(event) => updateTlsProfile(event.target.value)}
+                disabled={!token || tlsProfileSaving}
+                aria-label="TLS 指纹"
+              >
+                <option value="">默认（{tlsProfileDefault}）</option>
+                <option value="auto">auto（直连自动探测）</option>
+                <option value="chrome150">chrome150</option>
+                <option value="chrome146">chrome146</option>
+                <option value="chrome145">chrome145</option>
+                <option value="chrome142">chrome142</option>
+                <option value="chrome136">chrome136</option>
+              </select>
+            </label>
+          </div>
+          <span className="provider-ready">
+            {tlsProfileSaving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
+            当前生效：{tlsProfileEffective || "…"}
+            {!tlsProfile && tlsProfileEnv ? "（环境变量）" : ""}
+          </span>
         </div>
 
         {error && (
@@ -1498,6 +1602,79 @@ function App() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+      {proxyCheckOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !proxyChecking) setProxyCheckOpen(false);
+        }}>
+          <div className="batch-dialog proxy-check-dialog" role="dialog" aria-modal="true" aria-labelledby="proxy-check-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="proxy-check-title">代理出口检测</h2>
+                <span>与登录完全相同的链路：Chrome 指纹访问 chatgpt.com，按指纹逐个对比</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setProxyCheckOpen(false)} disabled={proxyChecking} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <label className="register-only-toggle proxy-check-solver" title="开启后会尝试本地过盾，单个指纹最长约 70 秒；关闭时只快速探测是否被 Cloudflare 挑战">
+              <input
+                type="checkbox"
+                checked={proxyCheckSolver}
+                onChange={(event) => setProxyCheckSolver(event.target.checked)}
+                disabled={proxyChecking}
+              />
+              尝试过盾（较慢，仅测默认指纹）
+            </label>
+            {proxyChecking && (
+              <div className="proxy-check-progress">
+                <LoaderCircle className="spin" size={16} />
+                正在用各指纹通过代理访问 chatgpt.com，请稍候…
+              </div>
+            )}
+            {proxyCheckError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{proxyCheckError}</div>}
+            {!proxyChecking && proxyCheckResults.length > 0 && (
+              <div className="proxy-check-list">
+                {proxyCheckResults.map((item) => (
+                  <div key={`${item.profile}-${item.elapsedMs}`} className={`proxy-check-item ${item.ok ? "ok" : "bad"}`}>
+                    <div className="proxy-check-item-head">
+                      {item.ok ? <Check size={15} /> : <CircleAlert size={15} />}
+                      <strong>{item.profile}</strong>
+                      <span>{item.ok ? "通过" : item.message}</span>
+                      {item.ok && (
+                        <button
+                          type="button"
+                          className="selection-text-button proxy-check-apply"
+                          onClick={() => updateTlsProfile(item.profile)}
+                          disabled={tlsProfileSaving || tlsProfile === item.profile}
+                          title="把这个指纹设为当前使用的 TLS 指纹，无需重启"
+                        >
+                          {tlsProfile === item.profile ? "使用中" : "使用此指纹"}
+                        </button>
+                      )}
+                    </div>
+                    <small>
+                      {item.exitIp
+                        ? `出口 IP：${item.exitIp}${item.exitLoc ? `（${item.exitLoc}${item.exitColo ? ` · ${item.exitColo}` : ""}）` : ""} · `
+                        : item.exitIpError ? `出口 IP：获取失败（${item.exitIpError}） · ` : ""}
+                      耗时 {(Math.max(1, Math.round((item.elapsedMs || 0) / 1000)))}s
+                    </small>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!proxyChecking && !proxyCheckResults.length && !proxyCheckError && (
+              <div className="dialog-hint">点击"开始检测"，会用与登录相同的链路逐个 TLS 指纹探测该代理。</div>
+            )}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setProxyCheckOpen(false)} disabled={proxyChecking}>关闭</button>
+              <button type="button" className="primary-button" onClick={checkAccountProxy} disabled={proxyChecking || !accountProxyUrl.trim()}>
+                {proxyChecking ? <LoaderCircle className="spin" size={17} /> : <ShieldCheck size={17} />}
+                {proxyChecking ? "检测中" : "开始检测"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
       {filterOpen && (
