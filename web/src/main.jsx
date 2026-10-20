@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -36,6 +36,8 @@ import {
 import "./styles.css";
 
 const POLL_INTERVAL_MS = 900;
+const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
+const DEFAULT_PAGE_SIZE = 100;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
@@ -79,7 +81,10 @@ function App() {
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
   const [page, setPage] = useState(1);
-  const [pagination, setPagination] = useState({ page: 1, pageSize: 100, total: 0, totalPages: 1 });
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [pagination, setPagination] = useState({ page: 1, pageSize: DEFAULT_PAGE_SIZE, total: 0, totalPages: 1 });
+  const selectionDragRef = useRef(null);
+  const suppressSelectionClickRef = useRef(null);
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
   const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
@@ -163,13 +168,13 @@ function App() {
         const data = emailFilter.length || query
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter, search: query }),
+              body: JSON.stringify({ page, pageSize, emails: emailFilter, search: query }),
             })
-          : await apiFetch(token, `/api/jobs?page=${page}`);
+          : await apiFetch(token, `/api/jobs?page=${page}&pageSize=${pageSize}`);
         if (!stopped) {
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
-          setPagination(data.pagination || { page, pageSize: 100, total: data.jobs.length, totalPages: 1 });
+          setPagination(data.pagination || { page, pageSize, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
@@ -185,7 +190,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter, searchQuery]);
+  }, [token, page, pageSize, emailFilter, searchQuery]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -519,7 +524,7 @@ function App() {
         body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), registerOnly }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 100));
+      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, pageSize));
       setEmail("");
       setError("");
     } catch (requestError) {
@@ -539,7 +544,7 @@ function App() {
         body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), registerOnly: batchRegisterOnly }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 100));
+      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, pageSize));
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
@@ -583,6 +588,62 @@ function App() {
       return next;
     });
   }
+
+  function setJobSelected(jobId, selected) {
+    setSelectedJobIds((current) => {
+      if (current.has(jobId) === selected) return current;
+      const next = new Set(current);
+      if (selected) next.add(jobId);
+      else next.delete(jobId);
+      return next;
+    });
+  }
+
+  function beginJobSelectionDrag(jobId, selected, event) {
+    if (!features.bulkActions || event.button !== 0) return;
+    // 阻止原生勾选和文本选择，由拖动逻辑统一维护选中状态
+    event.preventDefault();
+    suppressSelectionClickRef.current = jobId;
+    selectionDragRef.current = { value: !selected, lastJobId: jobId };
+    setJobSelected(jobId, !selected);
+    document.body.classList.add("job-selection-dragging");
+  }
+
+  function extendJobSelectionDrag(jobId) {
+    const drag = selectionDragRef.current;
+    if (!drag || drag.lastJobId === jobId) return;
+    drag.lastJobId = jobId;
+    setJobSelected(jobId, drag.value);
+  }
+
+  function finishJobSelectionDrag() {
+    if (!selectionDragRef.current) return;
+    selectionDragRef.current = null;
+    document.body.classList.remove("job-selection-dragging");
+    // click 事件在 mouseup 之后触发，延迟清除避免同一次点击被重复切换
+    window.setTimeout(() => {
+      suppressSelectionClickRef.current = null;
+    }, 0);
+  }
+
+  function handleJobSelectionClick(jobId) {
+    if (suppressSelectionClickRef.current === jobId) {
+      suppressSelectionClickRef.current = null;
+      return;
+    }
+    toggleJobSelection(jobId);
+  }
+
+  useEffect(() => {
+    const finish = () => finishJobSelectionDrag();
+    window.addEventListener("mouseup", finish);
+    window.addEventListener("blur", finish);
+    return () => {
+      window.removeEventListener("mouseup", finish);
+      window.removeEventListener("blur", finish);
+      document.body.classList.remove("job-selection-dragging");
+    };
+  }, []);
 
   function toggleAllOnPage() {
     setSelectedJobIds((current) => {
@@ -1132,7 +1193,9 @@ function App() {
                     onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
                     onError={setError}
                     selected={selectedJobIds.has(job.id)}
-                    onToggleSelected={() => toggleJobSelection(job.id)}
+                    onSelectionStart={(event) => beginJobSelectionDrag(job.id, selectedJobIds.has(job.id), event)}
+                    onSelectionEnter={() => extendJobSelectionDrag(job.id)}
+                    onSelectionClick={() => handleJobSelectionClick(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
@@ -1154,15 +1217,35 @@ function App() {
             </tbody>
           </table>
         </div>
-        {features.pagination && pagination.totalPages > 1 && (
+        {features.pagination && jobs.length > 0 && (
           <nav className="pagination" aria-label="任务分页">
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} title="上一页">
-              <ChevronLeft size={17} />
-            </button>
-            <span>第 <strong>{pagination.page}</strong> / {pagination.totalPages} 页</span>
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} title="下一页">
-              <ChevronRight size={17} />
-            </button>
+            <label className="page-size-control">
+              <span className="page-size-label">每页</span>
+              <select
+                value={pageSize}
+                onChange={(event) => {
+                  setPageSize(Number(event.target.value));
+                  setPage(1);
+                }}
+                aria-label="每页条数"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>{size}</option>
+                ))}
+              </select>
+              <span className="page-size-label">条</span>
+            </label>
+            {pagination.totalPages > 1 && (
+              <>
+                <button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} title="上一页">
+                  <ChevronLeft size={17} />
+                </button>
+                <span className="page-indicator">第 <strong>{pagination.page}</strong> / {pagination.totalPages} 页</span>
+                <button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} title="下一页">
+                  <ChevronRight size={17} />
+                </button>
+              </>
+            )}
           </nav>
         )}
       </section>
@@ -1728,7 +1811,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onSub2Update, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelectionStart, onSelectionEnter, onSelectionClick, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onSub2Update, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1878,12 +1961,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
   return (
-    <tr className={`job-row status-${job.status}`}>
-      <td className="select-cell">
+    <tr className={`job-row status-${job.status}`} onMouseEnter={onSelectionEnter}>
+      <td className="select-cell" onMouseDown={onSelectionStart}>
         <input
           type="checkbox"
           checked={selected}
-          onChange={onToggleSelected}
+          onChange={() => {}}
+          onClick={(event) => {
+            event.preventDefault();
+            onSelectionClick();
+          }}
           disabled={!selectionSupported}
           aria-label={`选择 ${job.email}`}
         />

@@ -634,6 +634,18 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .pagination span { min-width: 92px; text-align: center; }
 .pagination strong { color: var(--ink); }
+.pagination .page-size-control { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pagination .page-size-label { min-width: 0; }
+.pagination .page-size-control select {
+  height: 28px;
+  padding: 0 6px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 12px;
+}
+body.job-selection-dragging { user-select: none; -webkit-user-select: none; }
 
 .modal-backdrop {
   position: fixed;

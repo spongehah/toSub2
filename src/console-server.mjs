@@ -28,6 +28,7 @@ const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 100;
+const PAGE_SIZE_OPTIONS = new Set([20, 50, 100, 200, 500]);
 const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
@@ -234,17 +235,19 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage);
+    const requestedPageSize = normalizePageSize(requestUrl.searchParams.get("pageSize"));
+    await sendJobsPage(res, requestedPage, null, "", requestedPageSize);
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
+    const requestedPageSize = normalizePageSize(body.pageSize);
     const emailFilter = Array.isArray(body.emails) && body.emails.length ? normalizeEmailFilter(body.emails) : null;
     const searchQuery = normalizeSearchQuery(body.search);
     if (!emailFilter && !searchQuery) throw httpError(400, "请至少输入一个筛选邮箱或搜索关键词");
-    await sendJobsPage(res, requestedPage, emailFilter, searchQuery);
+    await sendJobsPage(res, requestedPage, emailFilter, searchQuery, requestedPageSize);
     return;
   }
 
@@ -681,7 +684,7 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null, searchQuery = "") {
+async function sendJobsPage(res, requestedPage, emailFilter = null, searchQuery = "", pageSize = PAGE_SIZE) {
   await syncCompletedOutputs();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
@@ -693,13 +696,13 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, searchQuery 
     return true;
   });
   const total = visibleJobs.length;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(requestedPage, totalPages);
-  const start = (page - 1) * PAGE_SIZE;
+  const start = (page - 1) * pageSize;
   sendJson(res, 200, {
-    jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
+    jobs: visibleJobs.slice(start, start + pageSize).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
-    pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
+    pagination: { page, pageSize, total, totalPages, totalAll: allJobs.length },
     filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total, search },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
@@ -707,6 +710,11 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, searchQuery 
       completed: allJobs.filter((job) => job.status === "completed").length,
     },
   });
+}
+
+function normalizePageSize(value) {
+  const pageSize = Number.parseInt(value, 10);
+  return PAGE_SIZE_OPTIONS.has(pageSize) ? pageSize : PAGE_SIZE;
 }
 
 function normalizeSearchQuery(value) {
@@ -2781,7 +2789,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             summary.busy += accounts.length;
             return;
           }
-          if (isAutoRepairCoolingDown(job)) {
+          if (isAutoRepairCoolingDown(job) && trigger !== "manual") {
             summary.cooldown += accounts.length;
             return;
           }
