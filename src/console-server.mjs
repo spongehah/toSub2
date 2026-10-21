@@ -25,6 +25,7 @@ const DEFAULT_TLS_PROFILE = "chrome150";
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
+const MAX_NETWORK_RETRIES = 3;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 100;
@@ -804,7 +805,9 @@ async function startJob(email, credentials = {}, proxyUrl = null, { registerOnly
     totpResultLoading: false,
     proxyRiskRetryCount: 0,
     proxyConnectionFailureCount: 0,
+    networkRetryCount: 0,
     proxyRiskRestarting: false,
+    networkRetryRestarting: false,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
     queueRunId: null,
@@ -1079,6 +1082,7 @@ async function retryJob(job, options = {}) {
   job.attempt += 1;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.networkRetryCount = 0;
   job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
@@ -1117,6 +1121,7 @@ async function regenerateJob(job, options = {}) {
   job.attempt += 1;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.networkRetryCount = 0;
   job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
@@ -1161,6 +1166,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
   job.totpSetupError = null;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.networkRetryCount = 0;
   job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
@@ -1240,6 +1246,7 @@ async function startTotpSetup(job, options = {}) {
   job.totpSetupResumesAuthorization = resumeAuthorization;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.networkRetryCount = 0;
   job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
@@ -1278,6 +1285,7 @@ async function startPasswordAdd(job, options = {}) {
   job.passwordAddError = null;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.networkRetryCount = 0;
   job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
@@ -1555,6 +1563,13 @@ function consumeOutput(job, rawText) {
       connectionFailure: scan.includes("PROXY_CONNECTION_RETRY"),
     }).catch((error) => {
       finishProxyRiskRetries(job, `自动更换代理会话失败：${error.message}`);
+    });
+    return;
+  }
+
+  if (scan.includes("[network-retry]")) {
+    void restartAfterNetworkError(job).catch((error) => {
+      finishNetworkRetries(job, `自动重试网络错误失败：${error.message}`);
     });
     return;
   }
@@ -1858,6 +1873,69 @@ function finishProxyRiskRetries(job, message) {
   if (job.resultSaved) {
     job.status = "completed";
     job.prompt = "原授权文件仍然可用，自动更换代理未能完成本次操作";
+    job.lastError = message;
+    job.runMode = null;
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    scheduleQueuedJobs();
+    return;
+  }
+  failJob(job, message);
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  scheduleQueuedJobs();
+}
+
+async function restartAfterNetworkError(job) {
+  if (job.networkRetryRestarting || isTerminalStatus(job.status)) return;
+  job.networkRetryRestarting = true;
+  const mode = job.runMode || job.queuedMode || "full";
+  try {
+    if ((job.networkRetryCount || 0) >= MAX_NETWORK_RETRIES) {
+      finishNetworkRetries(job, `网络连接连续失败，已自动重试 ${MAX_NETWORK_RETRIES} 次，仍未完成登录`);
+      return;
+    }
+    job.networkRetryCount = (job.networkRetryCount || 0) + 1;
+    stopMailPolling(job);
+    stopSmsPolling(job);
+    releaseSmsNumber(job, "idle");
+    job.queueRunId = null;
+    job.runId = crypto.randomUUID();
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    job.parserTail = "";
+    job.lastError = null;
+    job.currentPhone = null;
+    job.phoneError = null;
+    job.securityCheckRequired = false;
+    job.restartRequired = false;
+    appendJobLog(job, `[network] 网络连接错误，正在自动重试登录流程（${job.networkRetryCount}/${MAX_NETWORK_RETRIES}）。\n`);
+    job.status = "starting";
+    job.prompt = `网络连接错误，正在自动重试（${job.networkRetryCount}/${MAX_NETWORK_RETRIES}）`;
+    await saveJobMetadata(job);
+    enqueueJob(job, mode, job.prompt);
+  } finally {
+    job.networkRetryRestarting = false;
+  }
+}
+
+function finishNetworkRetries(job, message) {
+  job.networkRetryRestarting = false;
+  if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
+    restoreTotpSetupFailure(job, message);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (job.runMode === "password_add" || job.queuedMode === "password_add") {
+    restorePasswordAddFailure(job, message);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (job.resultSaved) {
+    job.status = "completed";
+    job.prompt = "原授权文件仍然可用，网络错误自动重试未完成本次操作";
     job.lastError = message;
     job.runMode = null;
     job.child?.kill("SIGTERM");
@@ -4066,12 +4144,17 @@ function restoredTotpSetupState(metadata = {}, credentials = {}) {
 function restoredProxyRiskState(metadata = {}) {
   const count = Number(metadata.proxy_risk_retry_count || 0);
   const connectionFailures = Number(metadata.proxy_connection_failure_count || 0);
+  const networkRetries = Number(metadata.network_retry_count || 0);
   return {
     proxyRiskRetryCount: Number.isInteger(count) && count >= 0 ? Math.min(count, MAX_PROXY_RISK_RETRIES) : 0,
     proxyConnectionFailureCount: Number.isInteger(connectionFailures) && connectionFailures >= 0
       ? Math.min(connectionFailures, MAX_PROXY_CONNECTION_FAILURES)
       : 0,
+    networkRetryCount: Number.isInteger(networkRetries) && networkRetries >= 0
+      ? Math.min(networkRetries, MAX_NETWORK_RETRIES)
+      : 0,
     proxyRiskRestarting: false,
+    networkRetryRestarting: false,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
   };
@@ -4636,6 +4719,7 @@ async function saveJobMetadata(job) {
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
+        network_retry_count: Number(job.networkRetryCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,

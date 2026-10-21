@@ -1204,6 +1204,35 @@ try {
   );
   assert.match(proxyConnectionAlwaysFailed.lastError || "", /连续失败 20 次/);
 
+  const networkRetryResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "network-retry@example.com" }),
+  });
+  assert.equal(networkRetryResponse.status, 201);
+  const networkRetryCreated = await networkRetryResponse.json();
+  await waitForJob(headers, networkRetryCreated.job.id, (value) => value.status === "completed");
+  const networkRetryLogs = await fetch(`${baseUrl}/api/jobs/${networkRetryCreated.job.id}/logs`, { headers })
+    .then((response) => response.json());
+  assert.match(networkRetryLogs.logs, /网络连接错误，正在自动重试登录流程（1\/3）/);
+
+  const networkRetryAlwaysResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "network-retry-always@example.com" }),
+  });
+  assert.equal(networkRetryAlwaysResponse.status, 201);
+  const networkRetryAlwaysCreated = await networkRetryAlwaysResponse.json();
+  const networkRetryAlwaysFailed = await waitForJob(
+    headers,
+    networkRetryAlwaysCreated.job.id,
+    (value) => value.status === "failed",
+  );
+  assert.match(networkRetryAlwaysFailed.lastError || "", /已自动重试 3 次/);
+  const networkRetryAlwaysLogs = await fetch(`${baseUrl}/api/jobs/${networkRetryAlwaysCreated.job.id}/logs`, { headers })
+    .then((response) => response.json());
+  assert.equal((networkRetryAlwaysLogs.logs.match(/正在自动重试登录流程/g) || []).length, 3);
+
   const searchResponse = await fetch(`${baseUrl}/api/jobs/query`, {
     method: "POST",
     headers,
@@ -1280,6 +1309,8 @@ try {
       proxyAlwaysCreated.job.id,
       proxyConnectionCreated.job.id,
       proxyConnectionAlwaysCreated.job.id,
+      networkRetryCreated.job.id,
+      networkRetryAlwaysCreated.job.id,
       directRiskCreated.job.id,
       bannedJobId,
       manualPhoneJobId,
@@ -1294,7 +1325,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 29);
+  assert.equal(deleted.deleted, 31);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

@@ -125,6 +125,23 @@ try {
     return;
   }
 
+  if (["network-retry@example.com", "network-retry-always@example.com"].includes(args.email)) {
+    const attemptPath = `${args.sub2apiOut}.network-retry-attempt`;
+    let attempt = 0;
+    try {
+      attempt = Number(await fs.readFile(attemptPath, "utf8")) || 0;
+    } catch {}
+    attempt += 1;
+    await fs.writeFile(attemptPath, String(attempt));
+    if (args.email === "network-retry-always@example.com" || attempt === 1) {
+      console.error("[network-retry] Timeout: simulated network connection failure");
+      process.exitCode = 1;
+      return;
+    }
+    await writeCompleted(args.sub2apiOut, args.email, "network-retried");
+    return;
+  }
+
   if (["resume@example.com", "resume-phone@example.com"].includes(args.email)) {
     const checkpointPath = args.checkpoint || args.resumeCheckpoint;
     let checkpoint = null;

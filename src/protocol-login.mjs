@@ -1270,6 +1270,7 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
     };
     console.log(`[sentinel] Dynamic SDK token ready${tokens.soToken ? " with Session Observer token" : " without Session Observer token"}.`);
   } catch (error) {
+    if (isNetworkConnectionError(error)) throw error;
     throw new Error(
       `[profile-security-check-required] Could not generate the Sentinel security token: ${error.message}`,
     );
@@ -1640,7 +1641,7 @@ async function postAddPhoneSend(client, authBase, phone, referer, payload) {
     const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/add-phone/send", payload, { referer });
     return { ok: true, data };
   } catch (error) {
-    if (isProxyRiskControlError(error)) throw error;
+    if (isProxyRiskControlError(error) || isNetworkConnectionError(error)) throw error;
     return { ok: false, message: error.message };
   }
 }
@@ -1652,7 +1653,7 @@ async function tryValidatePhoneOtp(client, authBase, code, referer) {
     }, { referer });
     return { ok: true, data };
   } catch (error) {
-    if (isProxyRiskControlError(error)) throw error;
+    if (isProxyRiskControlError(error) || isNetworkConnectionError(error)) throw error;
     return { ok: false, message: error.message };
   }
 }
@@ -2399,6 +2400,8 @@ Notes:
 run().catch((error) => {
   if (isProxyRiskControlError(error)) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
+  } else if (isNetworkConnectionError(error)) {
+    console.error(`[network-retry] ${String(error.message || "Network connection error").slice(0, 320)}`);
   } else {
     console.error(`[error] ${error.message}`);
   }
@@ -2407,4 +2410,22 @@ run().catch((error) => {
 
 function isProxyRiskControlError(error) {
   return /PROXY_RISK_CONTROL|PROXY_CONNECTION_RETRY/i.test(String(error?.message || ""));
+}
+
+function isNetworkConnectionError(error) {
+  const message = String(error?.message || "");
+  return (
+    /\b(?:Timeout|TimeoutError|ReadTimeout|ConnectionError|ConnectError|ProxyError|SSLError|RemoteProtocolError)\b/i.test(message)
+    || /\btimed?\s*out\b|operation timed out/i.test(message)
+    || /curl:\s*\((?:5|6|7|18|28|35|47|52|55|56|92)\)/i.test(message)
+    || /could not resolve|getaddrinfo|temporary failure in name resolution/i.test(message)
+    || /failed to connect|connection (?:reset|refused|closed|aborted|terminated)|socket hang up/i.test(message)
+    || /recv failure|send failure|empty reply|unexpected eof|tls connect error/i.test(message)
+    || /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|EAI_AGAIN|EPIPE|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENETRESET)\b/i.test(message)
+    || /\b(?:UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ERR_NETWORK)\b/i.test(message)
+    || /fetch failed|network error|other side closed/i.test(message)
+    || /TLS worker exited unexpectedly|TLS transport closed|Sentinel runtime exited unexpectedly/i.test(message)
+    || /Incomplete Sentinel token keys|Sentinel returned no value/i.test(message)
+    || /\bHTTP (?:502|503|504)\b/i.test(message)
+  );
 }

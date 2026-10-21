@@ -5,6 +5,11 @@ const { JSDOM, VirtualConsole } = require("jsdom");
 const nodeCrypto = require("crypto");
 
 const input = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+// Raise the SDK's 4-second frame response deadline to 10 seconds for slow proxy links.
+input.sdkSource = String(input.sdkSource || "").replace(
+  /(me\(\{e:[^,]+,p:[^}]+\},[^)]+\)\)\),)\d+(?:e\d+)?/,
+  "$11e4",
+);
 const errors = [];
 const requests = [];
 const pending = new Map();
