@@ -41,6 +41,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-queue-protocol.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
+    INPUT_WAIT_TIMEOUT_MS: "5000",
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,
@@ -125,7 +126,13 @@ try {
   assert.equal(reloginJob.attempt, 3, "concurrent relogin requests must increment the attempt only once");
   const logsAfterConcurrentRelogin = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
   assert.equal(countOccurrences(logsAfterConcurrentRelogin.logs, "Mock queued login started"), 3);
-  await fetch(`${baseUrl}/api/jobs/${jobId}/cancel`, { method: "POST", headers, body: "{}" });
+
+  // 等待人工输入超时后自动取消，释放并发且不影响自动修复资格
+  const timedOutJob = await waitForJob(headers, jobId, (job) => job.status === "canceled");
+  assert.match(timedOutJob.lastError || "", /等待输入超过/);
+  assert.equal(timedOutJob.autoRepairEligible, reloginJob.autoRepairEligible);
+  assert.equal(timedOutJob.autoRepairEligibilityReason, reloginJob.autoRepairEligibilityReason);
+  assert.equal(timedOutJob.autoRepairBlocked, false);
   console.log("console job lock tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${consoleLogs}`;

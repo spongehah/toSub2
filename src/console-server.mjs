@@ -40,6 +40,8 @@ const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
+const INPUT_WAIT_TIMEOUT_MS = readDurationEnv("INPUT_WAIT_TIMEOUT_MS", 3 * 60_000, 1_000);
+const INPUT_WAIT_STATUSES = new Set(["email_otp", "password", "mfa_otp", "totp_setup_otp", "phone", "phone_otp"]);
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_MAIL_REQUEST_HEADERS = 64;
 const FORBIDDEN_MAIL_REQUEST_HEADERS = new Set([
@@ -3322,10 +3324,31 @@ function canAddPassword(job) {
 
 function setStage(job, status, prompt) {
   if (isTerminalStatus(job.status)) return;
+  const previousStatus = job.status;
   job.status = status;
   job.prompt = prompt;
   job.lastError = null;
   touch(job);
+  if (status !== previousStatus) armInputWaitTimeout(job);
+}
+
+function armInputWaitTimeout(job) {
+  // 状态切换时清掉旧计时，进入等待输入状态才重新开始计时
+  clearTimeout(job.inputWaitTimer);
+  job.inputWaitTimer = null;
+  if (!INPUT_WAIT_STATUSES.has(job.status)) return;
+  const { status, runId } = job;
+  job.inputWaitTimer = setTimeout(() => {
+    void withEmailJobLock(job.email, async () => {
+      if (job.status !== status || job.runId !== runId || !job.child) return;
+      // 取消不会改动自动修复资格，巡检仍可再次自动登录
+      const minutes = Math.round(INPUT_WAIT_TIMEOUT_MS / 60_000 * 10) / 10;
+      job.lastError = `等待输入超过 ${minutes} 分钟，已自动取消任务以释放并发`;
+      appendJobLog(job, `[timeout] 等待 ${status} 输入超过 ${minutes} 分钟，自动取消任务。\n`);
+      await cancelJob(job);
+    }).catch(() => {});
+  }, INPUT_WAIT_TIMEOUT_MS);
+  job.inputWaitTimer.unref?.();
 }
 
 function failJob(job, message) {
