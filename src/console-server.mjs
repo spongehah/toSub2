@@ -4366,10 +4366,17 @@ function parseAccountLineWithDelimiter(line, delimiter, lineNumber) {
   if (split.separators.length === 0) return null;
   if (split.segments.length > 64) return null;
   const fields = split.segments.map((raw, index) => ({ raw, value: raw.trim(), index, type: "plain" }));
-  if (fields.filter((field) => isEmail(field.value)).length > 1) {
-    return { ambiguity: "中识别到多个完整邮箱，无法确定哪个是账号" };
+  const emailFields = fields.filter((field) => isEmail(field.value));
+  let emailRange;
+  if (emailFields.length > 1) {
+    // A leading email is the account; later email-like fields (e.g. password 4M93wSP8@G60E.rI) stay plain.
+    if (emailFields[0].index !== 0) {
+      return { ambiguity: "中识别到多个完整邮箱，无法确定哪个是账号" };
+    }
+    emailRange = { start: 0, end: 0, value: emailFields[0].value };
+  } else {
+    emailRange = findLongestEmailRange(split);
   }
-  const emailRange = findLongestEmailRange(split);
   if (!emailRange) return null;
   for (let index = emailRange.start; index <= emailRange.end; index += 1) fields[index].type = "email";
 

@@ -800,6 +800,8 @@ try {
     `base32-password@example.org----ABCDEFGHIJKLMNOP----${mailApiUrl}`,
     "biers.ellipse.case@icloud.com----aBCD2345eFGH6723----JBSWY3DPEHPK3PXPNB2W45DFOIZAQWER",
     "dot-password@example.com----r7.UjRUWVVS----JBSWY3DPEHPK3PXP",
+    "email-like-password@example.com---4M93wSP8@G60E.rI---SDQGYTNAYA3LTDAUHRBZD6FEQTR6LMRJ",
+    `two-emails@example.com----second@example.net----${mailApiUrl}`,
   ];
   const batchResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
     method: "POST",
@@ -809,7 +811,7 @@ try {
   const batchText = await batchResponse.text();
   assert.equal(batchResponse.status, 201, batchText);
   const batch = JSON.parse(batchText);
-  assert.equal(batch.jobs.length, 13);
+  assert.equal(batch.jobs.length, 15);
   batch.jobs
     .filter((item) => !["manual-totp@example.net", "reverse.api-order@example.xyz"].includes(item.email))
     .forEach((item) => assert.equal(item.loginMode, "password"));
@@ -837,6 +839,9 @@ try {
   assert.equal(batch.jobs.find((item) => item.email === "biers.ellipse.case@icloud.com").loginMode, "password");
   assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").hasTotpKey, true);
   assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").loginMode, "password");
+  assert.equal(batch.jobs.find((item) => item.email === "email-like-password@example.com").hasTotpKey, true);
+  assert.equal(batch.jobs.find((item) => item.email === "email-like-password@example.com").loginMode, "password");
+  assert.equal(batch.jobs.find((item) => item.email === "two-emails@example.com").loginMode, "password");
   await Promise.all(batch.jobs.map((item) => waitForJob(headers, item.id, (value) => value.status === "completed")));
 
   const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
@@ -860,10 +865,12 @@ try {
     `base32-password@example.org----ABCDEFGHIJKLMNOP----${mailApiUrl}`,
     "biers.ellipse.case@icloud.com----aBCD2345eFGH6723----JBSWY3DPEHPK3PXPNB2W45DFOIZAQWER",
     "dot-password@example.com----r7.UjRUWVVS----JBSWY3DPEHPK3PXP",
+    "email-like-password@example.com----4M93wSP8@G60E.rI----SDQGYTNAYA3LTDAUHRBZD6FEQTR6LMRJ",
+    `two-emails@example.com----second@example.net----${mailApiUrl}`,
   ].sort());
 
   const ambiguousBatchLines = [
-    `two-emails@example.com----second@example.net----${mailApiUrl}`,
+    `leading-password----first@example.com----second@example.net`,
     `comma-url@example.com,${mailApiUrl}?a=1,b=2`,
     "odd-hyphen@example.com-----JBSWY3DPEHPK3PXP",
     `mixed-delimiter@example.com----password|${mailApiUrl}|JBSWY3DPEHPK3PXP`,
@@ -1325,7 +1332,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 31);
+  assert.equal(deleted.deleted, 33);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
