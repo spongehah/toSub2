@@ -27,7 +27,8 @@ start() {
   cd "$root"
   # shellcheck disable=SC1091
   source "$venv_dir/bin/activate"
-  TOSUB2_PYTHON="$venv_dir/bin/python" nohup npm run dev > "$log_file" 2>&1 &
+  # 直接启动 node，确保 pid_file 记录的是服务进程本身，stop/restart 才能终止监听端口的进程
+  TOSUB2_PYTHON="$venv_dir/bin/python" nohup node "$root/src/console-server.mjs" > "$log_file" 2>&1 &
   echo $! > "$pid_file"
   echo "toSub2 已启动，PID $(cat "$pid_file")"
   echo "日志：$log_file"
