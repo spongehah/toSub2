@@ -117,7 +117,10 @@ const requestedHost = String(
 const portArg = process.argv.find((item) => item.startsWith("--port="));
 const portIndex = process.argv.indexOf("--port");
 const requestedPort = Number(
-  portArg?.slice("--port=".length) || (portIndex >= 0 ? process.argv[portIndex + 1] : "") || DEFAULT_PORT,
+  portArg?.slice("--port=".length)
+    || (portIndex >= 0 ? process.argv[portIndex + 1] : "")
+    || process.env.ONBOARDING_PORT
+    || DEFAULT_PORT,
 );
 const hmrPort = requestedPort <= 45_535 ? requestedPort + 20_000 : requestedPort - 20_000;
 
@@ -144,6 +147,10 @@ const vite = await createViteServer({
   server: {
     middlewareMode: true,
     hmr: { port: hmrPort, clientPort: hmrPort },
+    fs: {
+      strict: true,
+      deny: [".env", ".env.*", "*.pem", "*.key"],
+    },
   },
 });
 
@@ -242,6 +249,10 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/logout") {
+    if (consolePassword && !readConsoleSession(req)) {
+      sendJson(res, 401, { error: "请先登录控制台" });
+      return;
+    }
     const sessionId = readCookie(req, "tosub2_session");
     if (sessionId) consoleSessions.delete(sessionId);
     sendJson(res, 200, { ok: true }, {
