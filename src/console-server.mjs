@@ -146,6 +146,7 @@ const vite = await createViteServer({
   plugins: [react()],
   server: {
     middlewareMode: true,
+    allowedHosts: true,
     hmr: { port: hmrPort, clientPort: hmrPort },
     fs: {
       strict: true,
