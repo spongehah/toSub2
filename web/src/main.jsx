@@ -374,6 +374,12 @@ function App() {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
       return;
     }
+    const rateLimitMinutes = String(sub2apiSettingsDraft.rateLimitMinutes || "").trim();
+    if (String(sub2apiSettingsDraft.rateLimitModels || "").trim()
+      && (!/^\d+$/.test(rateLimitMinutes) || Number(rateLimitMinutes) < 1 || Number(rateLimitMinutes) > 10080)) {
+      setSub2apiSettingsError("请填写 1 到 10080 之间的新账号限流判定窗口（分钟）");
+      return;
+    }
     const nextSettings = {
       ...readSub2ApiSettings(sub2apiSettingsDraft),
       baseUrl: baseUrl.replace(/\/+$/, ""),
@@ -1693,8 +1699,31 @@ function App() {
                   spellCheck="false"
                 />
               </label>
+              <label className="settings-field wide-settings-field">
+                <span>新账号限流模型</span>
+                <textarea
+                  className="sub2api-model-textarea"
+                  value={sub2apiSettingsDraft.rateLimitModels}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, rateLimitModels: event.target.value }))}
+                  placeholder={"新账号创建后命中这些模型限流时会重新登录，每行一个模型，也支持逗号分隔"}
+                  rows="3"
+                  spellCheck="false"
+                />
+              </label>
+              <label className="settings-field">
+                <span>新账号限流判定窗口（分钟）</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="10080"
+                  step="1"
+                  value={sub2apiSettingsDraft.rateLimitMinutes}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, rateLimitMinutes: event.target.value }))}
+                  placeholder="例如 30"
+                />
+              </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -2394,7 +2423,7 @@ function localTimestamp(date = new Date()) {
 
 function formatMonitorResult(result) {
   if (!result || typeof result !== "object") return "号池巡检已完成";
-  const parts = [`检查 ${Number(result.checked || 0)} 条异常记录`];
+  const parts = [`检查 ${Number(result.checked || 0)} 条账号记录`];
   if (result.started) parts.push(`已启动自动修复 ${result.started} 条`);
   if (result.updated) parts.push(`已更新 ${result.updated} 条`);
   if (result.blocked) parts.push(`永久跳过 ${result.blocked} 条`);
@@ -2621,6 +2650,8 @@ function normalizeSub2ApiSettings(value) {
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
+    rateLimitModels: String(stored.rateLimitModels || ""),
+    rateLimitMinutes: String(stored.rateLimitMinutes ?? ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",
