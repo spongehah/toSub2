@@ -61,6 +61,12 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
 function App() {
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [consolePassword, setConsolePassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
   const [jobs, setJobs] = useState([]);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -136,19 +142,57 @@ function App() {
 
   useEffect(() => {
     let stopped = false;
-    fetch("/api/bootstrap")
+    fetch("/api/bootstrap", { credentials: "same-origin" })
       .then(readResponse)
       .then((data) => {
-        if (!stopped) {
-          setToken(data.token);
-          setFeatures(data.features || {});
-        }
+        if (stopped) return;
+        applyBootstrap(data);
       })
-      .catch((requestError) => setError(requestError.message));
+      .catch((requestError) => setError(requestError.message))
+      .finally(() => {
+        if (!stopped) setAuthReady(true);
+      });
     return () => {
       stopped = true;
     };
   }, []);
+
+  function applyBootstrap(data) {
+    const signedIn = Boolean(data.authenticated && data.token);
+    setAuthRequired(Boolean(data.authRequired));
+    setAuthenticated(signedIn);
+    setToken(signedIn ? data.token : "");
+    setFeatures(signedIn ? data.features || {} : {});
+  }
+
+  async function loginConsole(event) {
+    event.preventDefault();
+    setLoginBusy(true);
+    setLoginError("");
+    try {
+      const data = await apiFetch("", "/api/login", {
+        method: "POST",
+        body: JSON.stringify({ password: consolePassword }),
+      });
+      applyBootstrap({ ...data, authRequired: true, authenticated: true });
+      setConsolePassword("");
+    } catch (requestError) {
+      setLoginError(requestError.message);
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  async function logoutConsole() {
+    try {
+      await apiFetch(token, "/api/logout", { method: "POST" });
+    } catch {}
+    setToken("");
+    setFeatures({});
+    setAuthenticated(false);
+    setAuthRequired(true);
+    setJobs([]);
+  }
 
   useEffect(() => {
     if (!token) return;
@@ -662,6 +706,7 @@ function App() {
     try {
       const response = await fetch("/api/jobs/download-batch", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "content-type": "application/json", "x-console-token": token },
         body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
@@ -761,6 +806,7 @@ function App() {
     try {
       const response = await fetch("/api/jobs/export-source", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "content-type": "application/json", "x-console-token": token },
         body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
@@ -852,6 +898,43 @@ function App() {
     }
   }
 
+  if (!authReady) {
+    return (
+      <main className="app-shell login-shell">
+        <section className="login-card"><LoaderCircle className="spin" size={22} /></section>
+      </main>
+    );
+  }
+
+  if (authRequired && !authenticated) {
+    return (
+      <main className="app-shell login-shell">
+        <form className="login-card" onSubmit={loginConsole}>
+          <div className="brand-mark"><ShieldCheck size={21} strokeWidth={2.2} /></div>
+          <h1>控制台登录</h1>
+          <p>请输入控制台密码后继续</p>
+          <label className="login-field">
+            <KeyRound size={16} aria-hidden="true" />
+            <input
+              type="password"
+              value={consolePassword}
+              onChange={(event) => setConsolePassword(event.target.value)}
+              placeholder="控制台密码"
+              autoComplete="current-password"
+              aria-label="控制台密码"
+              required
+            />
+          </label>
+          {loginError && <div className="dialog-error">{loginError}</div>}
+          <button className="primary-button" type="submit" disabled={loginBusy || !consolePassword}>
+            {loginBusy ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+            登录
+          </button>
+        </form>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -863,6 +946,9 @@ function App() {
           </div>
         </div>
         <div className="summary" aria-label="任务统计">
+          {authRequired && (
+            <button className="secondary-button logout-button" type="button" onClick={logoutConsole}>退出</button>
+          )}
           <span><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
           <span><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
           <span><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
@@ -1948,6 +2034,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
   async function download() {
     try {
       const response = await fetch(`/api/jobs/${job.id}/download`, {
+        credentials: "same-origin",
         headers: { "x-console-token": token },
       });
       if (!response.ok) throw new Error((await response.json()).error || "下载失败");
@@ -2329,9 +2416,10 @@ function formatRelativeMonitorTime(value) {
 async function apiFetch(token, url, options = {}) {
   const response = await fetch(url, {
     ...options,
+    credentials: "same-origin",
     headers: {
       "content-type": "application/json",
-      "x-console-token": token,
+      ...(token ? { "x-console-token": token } : {}),
       ...(options.headers || {}),
     },
   });

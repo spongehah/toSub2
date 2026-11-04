@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +61,7 @@ const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.
 const SMS_POLL_TIMEOUT_MS = Number(process.env.SMS_POLL_TIMEOUT_MS || process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
+loadEnvFile(path.join(TOOL_ROOT, ".env"));
 const WEB_ROOT = path.join(TOOL_ROOT, "web");
 const PROTOCOL_SCRIPT = path.resolve(process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
 const WORKSPACE_ROOT = TOOL_ROOT;
@@ -72,6 +74,9 @@ const TLS_PROFILE_SETTING_PATH = path.join(OUTPUT_ROOT, TLS_PROFILE_SETTING_FILE
 let tlsProfileSetting = null;
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
+const CONSOLE_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const consolePassword = readConsolePassword(process.argv, process.env);
+const consoleSessions = new Map();
 const jobs = new Map();
 // 已删除任务的 ID 墓碑：防止运行中子进程回写输出文件后，目录同步把任务重新导入
 const deletedJobIds = new Set();
@@ -124,7 +129,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
   throw new Error("--port must be an integer between 1 and 65535");
 }
 
-await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await fsPromises.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadTlsProfileConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
@@ -181,8 +186,10 @@ server.listen(requestedPort, requestedHost, () => {
   console.log(`[ok] ChatGPT onboarding console: ${urls[0]}`);
   for (const url of urls.slice(1)) console.log(`[ok] LAN access: ${url}`);
   console.log(`[info] Output directory: ${OUTPUT_ROOT}`);
-  if (isWildcardHost(requestedHost)) {
-    console.log("[note] LAN access is enabled without authentication. Keep downloaded OAuth files private.");
+  if (consolePassword) {
+    console.log("[note] Console password is enabled. Open the page and sign in before using the console.");
+  } else if (isWildcardHost(requestedHost)) {
+    console.log("[note] LAN access is enabled without authentication. Set CONSOLE_PASSWORD before exposing this server.");
   } else {
     console.log("[note] This server only listens on the configured host. Keep downloaded OAuth files private.");
   }
@@ -206,28 +213,45 @@ function getConsoleUrls(host, port) {
 
 async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
+    const session = readConsoleSession(req);
     sendJson(res, 200, {
-      token: consoleToken,
-      features: {
-        retry: true,
-        regenerate: true,
-        phoneContext: true,
-        batchDownload: true,
-        bulkActions: true,
-        pagination: true,
-        uniqueEmail: true,
-        smsProviders: publicSmsProviderDefinitions(),
-        queue: true,
-        sourceExport: true,
-        cancelAll: true,
-        sub2apiUpload: true,
-        sub2apiMonitor: true,
-        tlsFingerprint: true,
-        totpSetup: true,
-        passwordAdd: true,
-        forceRelogin: true,
-      },
+      authRequired: Boolean(consolePassword),
+      authenticated: !consolePassword || Boolean(session),
+      ...(session || !consolePassword ? { token: consoleToken, features: consoleFeatures() } : {}),
     });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/login") {
+    if (!consolePassword) {
+      sendJson(res, 200, { token: consoleToken, features: consoleFeatures() });
+      return;
+    }
+    const body = await readJson(req);
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!password || !safeEqualText(password, consolePassword)) {
+      sendJson(res, 401, { error: "控制台密码错误" });
+      return;
+    }
+    const sessionId = crypto.randomBytes(24).toString("base64url");
+    consoleSessions.set(sessionId, Date.now() + CONSOLE_SESSION_TTL_MS);
+    sendJson(res, 200, { token: consoleToken, features: consoleFeatures() }, {
+      "set-cookie": consoleSessionCookie(sessionId, req),
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/logout") {
+    const sessionId = readCookie(req, "tosub2_session");
+    if (sessionId) consoleSessions.delete(sessionId);
+    sendJson(res, 200, { ok: true }, {
+      "set-cookie": clearConsoleSessionCookie(req),
+    });
+    return;
+  }
+
+  if (consolePassword && !readConsoleSession(req)) {
+    sendJson(res, 401, { error: "请先登录控制台" });
     return;
   }
 
@@ -745,7 +769,7 @@ async function startJob(email, credentials = {}, proxyUrl = null, { registerOnly
   const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
   const totpResultPath = path.join(outputDir, TOTP_SETUP_RESULT_FILENAME);
   const passwordAddResultPath = path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME);
-  await fs.mkdir(outputDir, { recursive: true });
+  await fsPromises.mkdir(outputDir, { recursive: true });
 
   const createdAt = new Date().toISOString();
   const job = {
@@ -1322,7 +1346,7 @@ function generateStrongPassword() {
 async function finishPasswordAdd(job, code, signal) {
   let result = null;
   try {
-    result = JSON.parse(await fs.readFile(job.passwordAddResultPath, "utf8"));
+    result = JSON.parse(await fsPromises.readFile(job.passwordAddResultPath, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") job.passwordAddError = `添加密码结果无法读取：${error.message}`;
   }
@@ -1392,7 +1416,7 @@ function restorePasswordAddFailure(job, message) {
 }
 
 async function loadTotpSetupResult(job) {
-  const data = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
+  const data = JSON.parse(await fsPromises.readFile(job.totpResultPath, "utf8"));
   if (data?.version !== 1) throw new Error("2FA 设置结果文件格式不正确");
   if (data.already_enabled) {
     job.totpKnownEnabled = true;
@@ -1477,7 +1501,7 @@ async function finishTotpSetup(job, code, signal) {
 async function removePrivateFile(filePath) {
   if (!filePath) return;
   try {
-    await fs.unlink(filePath);
+    await fsPromises.unlink(filePath);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -2461,7 +2485,7 @@ async function downloadResult(res, job) {
     return;
   }
   const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
-  const data = await fs.readFile(job.outputPath);
+  const data = await fsPromises.readFile(job.outputPath);
   res.writeHead(200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="${safeEmail}-sub2api-import-oauth-${downloadTimestamp()}.json"`,
@@ -2488,7 +2512,7 @@ async function downloadBatchResult(res, ids) {
   const proxies = [];
   for (const job of downloadable) {
     if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    const data = JSON.parse(await fsPromises.readFile(job.outputPath, "utf8"));
     if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
       throw httpError(409, `${job.email} 的导入文件格式不正确`);
     }
@@ -2518,7 +2542,7 @@ async function buildSub2ApiUploadPayload(downloadable) {
   const proxies = [];
   for (const job of downloadable) {
     if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    const data = JSON.parse(await fsPromises.readFile(job.outputPath, "utf8"));
     if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
       throw httpError(409, `${job.email} 的导入文件格式不正确`);
     }
@@ -2700,7 +2724,7 @@ function syncDirectTlsProfileProbe() {
 
 async function loadTlsProfileConfiguration() {
   try {
-    const saved = JSON.parse(await fs.readFile(TLS_PROFILE_SETTING_PATH, "utf8"));
+    const saved = JSON.parse(await fsPromises.readFile(TLS_PROFILE_SETTING_PATH, "utf8"));
     tlsProfileSetting = normalizeTlsProfileSetting(saved.profile) || null;
   } catch (error) {
     if (error?.code !== "ENOENT") {
@@ -2713,7 +2737,7 @@ async function loadTlsProfileConfiguration() {
 
 async function persistTlsProfileConfiguration() {
   if (!tlsProfileSetting) {
-    await fs.rm(TLS_PROFILE_SETTING_PATH, { force: true });
+    await fsPromises.rm(TLS_PROFILE_SETTING_PATH, { force: true });
     return;
   }
   const payload = {
@@ -2722,13 +2746,13 @@ async function persistTlsProfileConfiguration() {
     updated_at: new Date().toISOString(),
   };
   const tempPath = `${TLS_PROFILE_SETTING_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, TLS_PROFILE_SETTING_PATH);
+  await fsPromises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fsPromises.rename(tempPath, TLS_PROFILE_SETTING_PATH);
 }
 
 async function loadSub2ApiMonitorConfiguration() {
   try {
-    const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
+    const saved = JSON.parse(await fsPromises.readFile(SUB2API_MONITOR_PATH, "utf8"));
     const config = normalizeSub2ApiConfig(saved.config);
     sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
     sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
@@ -2746,7 +2770,7 @@ async function loadSub2ApiMonitorConfiguration() {
 
 async function persistSub2ApiMonitorConfiguration() {
   if (!sub2ApiMonitorConfig) {
-    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
+    await fsPromises.rm(SUB2API_MONITOR_PATH, { force: true });
     return;
   }
   const payload = {
@@ -2771,8 +2795,8 @@ async function persistSub2ApiMonitorConfiguration() {
     updatedAt: new Date().toISOString(),
   };
   const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+  await fsPromises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fsPromises.rename(tempPath, SUB2API_MONITOR_PATH);
 }
 
 function publicSub2ApiMonitorState() {
@@ -3542,7 +3566,7 @@ async function deleteJobsByEmail(email) {
   });
   await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
   await Promise.all([
-    ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
+    ...[...directories].map((directory) => fsPromises.rm(directory, { recursive: true, force: true })),
     deleteStoredLoginCredentials(email),
   ]);
   scheduleQueuedJobs();
@@ -3566,7 +3590,7 @@ async function syncCompletedOutputs(force = false) {
     lastOutputSyncAt = Date.now();
     let entries = [];
     try {
-      entries = await fs.readdir(OUTPUT_ROOT, { withFileTypes: true });
+      entries = await fsPromises.readdir(OUTPUT_ROOT, { withFileTypes: true });
     } catch {
       return;
     }
@@ -3579,11 +3603,11 @@ async function syncCompletedOutputs(force = false) {
       const passwordAddResultPath = path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME);
       let metadata = {};
       try {
-        metadata = JSON.parse(await fs.readFile(path.join(outputDir, JOB_META_FILENAME), "utf8"));
+        metadata = JSON.parse(await fsPromises.readFile(path.join(outputDir, JOB_META_FILENAME), "utf8"));
       } catch {}
 
       try {
-        const [raw, stat] = await Promise.all([fs.readFile(outputPath, "utf8"), fs.stat(outputPath)]);
+        const [raw, stat] = await Promise.all([fsPromises.readFile(outputPath, "utf8"), fsPromises.stat(outputPath)]);
         const data = JSON.parse(raw);
         if (data.type !== "sub2api-data" || !Array.isArray(data.accounts) || !data.accounts.length) throw new Error("invalid output");
         const account = data.accounts[0];
@@ -3661,7 +3685,7 @@ async function syncCompletedOutputs(force = false) {
       } catch {}
 
       try {
-        const [raw, stat] = await Promise.all([fs.readFile(checkpointPath, "utf8"), fs.stat(checkpointPath)]);
+        const [raw, stat] = await Promise.all([fsPromises.readFile(checkpointPath, "utf8"), fsPromises.stat(checkpointPath)]);
         const checkpoint = JSON.parse(raw);
         if (checkpoint?.version !== 1 || typeof checkpoint.email !== "string" || !checkpoint.email) return;
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
@@ -3855,7 +3879,7 @@ async function syncCompletedOutputs(force = false) {
 async function recoverActivatedTotpCredential({ email, resultPath, credentials }) {
   let result;
   try {
-    result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+    result = JSON.parse(await fsPromises.readFile(resultPath, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") return { credentials, recovered: false, error: null };
     return { credentials, recovered: false, error: `2FA 结果文件无法读取：${error.message}` };
@@ -3888,7 +3912,7 @@ async function recoverActivatedTotpCredential({ email, resultPath, credentials }
 async function recoverAddedPasswordCredential({ email, resultPath, credentials }) {
   let result;
   try {
-    result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+    result = JSON.parse(await fsPromises.readFile(resultPath, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") return { credentials, recovered: false, error: null, addedAt: null };
     return { credentials, recovered: false, error: `添加密码结果文件无法读取：${error.message}`, addedAt: null };
@@ -4773,8 +4797,8 @@ async function saveJobMetadata(job) {
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-      await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-      await fs.rename(tempPath, metadataPath);
+      await fsPromises.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+      await fsPromises.rename(tempPath, metadataPath);
     });
   return job.metadataWritePromise;
 }
@@ -4974,7 +4998,7 @@ function sortNewestFirst(a, b) {
 
 async function fileExists(filePath) {
   try {
-    await fs.access(filePath);
+    await fsPromises.access(filePath);
     return true;
   } catch {
     return false;
@@ -4994,7 +5018,7 @@ async function readJson(req) {
   }
 }
 
-function sendJson(res, status, data) {
+function sendJson(res, status, data, extraHeaders = {}) {
   if (res.headersSent) return;
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -5002,8 +5026,111 @@ function sendJson(res, status, data) {
     "content-length": Buffer.byteLength(body),
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    ...extraHeaders,
   });
   res.end(body);
+}
+
+function consoleFeatures() {
+  return {
+    retry: true,
+    regenerate: true,
+    phoneContext: true,
+    batchDownload: true,
+    bulkActions: true,
+    pagination: true,
+    uniqueEmail: true,
+    smsProviders: publicSmsProviderDefinitions(),
+    queue: true,
+    sourceExport: true,
+    cancelAll: true,
+    sub2apiUpload: true,
+    sub2apiMonitor: true,
+    tlsFingerprint: true,
+    totpSetup: true,
+    passwordAdd: true,
+    forceRelogin: true,
+  };
+}
+
+function loadEnvFile(filePath) {
+  // 启动时加载项目根目录 .env；已有命令行环境变量优先，不覆盖。
+  let text;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || process.env[key] !== undefined) continue;
+    let value = line.slice(separator + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+function readConsolePassword(argv, env) {
+  const inlineArg = argv.find((item) => item.startsWith("--console-password="));
+  const flagIndex = argv.indexOf("--console-password");
+  const fromArg = inlineArg?.slice("--console-password=".length)
+    || (flagIndex >= 0 ? argv[flagIndex + 1] : "");
+  return String(fromArg || env.CONSOLE_PASSWORD || "").trim();
+}
+
+function readConsoleSession(req) {
+  if (!consolePassword) return { open: true };
+  const sessionId = readCookie(req, "tosub2_session");
+  if (!sessionId) return null;
+  const expiresAt = consoleSessions.get(sessionId);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    consoleSessions.delete(sessionId);
+    return null;
+  }
+  return { id: sessionId, expiresAt };
+}
+
+function readCookie(req, name) {
+  const cookies = String(req.headers.cookie || "").split(";");
+  for (const cookie of cookies) {
+    const separator = cookie.indexOf("=");
+    if (separator < 0) continue;
+    if (cookie.slice(0, separator).trim() !== name) continue;
+    return decodeURIComponent(cookie.slice(separator + 1).trim());
+  }
+  return "";
+}
+
+function consoleSessionCookie(sessionId, req) {
+  const secure = isSecureRequest(req) ? "; Secure" : "";
+  return `tosub2_session=${encodeURIComponent(sessionId)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${CONSOLE_SESSION_TTL_MS / 1000}${secure}`;
+}
+
+function clearConsoleSessionCookie(req) {
+  const secure = isSecureRequest(req) ? "; Secure" : "";
+  return `tosub2_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0${secure}`;
+}
+
+function isSecureRequest(req) {
+  const forwarded = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  return forwarded === "https" || Boolean(req.socket?.encrypted);
+}
+
+function safeEqualText(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  if (leftBuffer.length !== rightBuffer.length) {
+    crypto.timingSafeEqual(leftBuffer, leftBuffer);
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function httpError(status, message) {

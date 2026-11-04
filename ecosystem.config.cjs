@@ -21,6 +21,7 @@ module.exports = {
     env: {
       NODE_ENV: "production",
       ONBOARDING_OUTPUT_ROOT: outputRoot,
+      CONSOLE_PASSWORD: process.env.CONSOLE_PASSWORD || "",
     },
   }],
 };

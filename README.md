@@ -66,6 +66,26 @@ http://127.0.0.1:4399
 npm run dev -- --port 4400
 ```
 
+部署到可被他人访问的地址时，在项目根目录创建 `.env`。未设置密码时保持本地免登录。
+
+```bash
+CONSOLE_PASSWORD=your-password
+ONBOARDING_HOST=0.0.0.0
+ONBOARDING_PORT=4400
+```
+
+```bash
+npm run dev
+```
+
+也可以把密码直接传给启动参数：
+
+```bash
+npm run dev -- --host 0.0.0.0 --port 4400 --console-password 'your-password'
+```
+
+PM2 同样会读取项目根目录的 `.env`。命令行环境变量优先于 `.env`。
+
 允许局域网设备访问：
 
 ```bash
