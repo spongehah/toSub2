@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -99,13 +100,33 @@ try {
     proxyUrl: "",
   });
 
-  const unsupportedStore = createCredentialStore({ platform: "linux" });
-  await assert.rejects(
-    unsupportedStore.save(email, credentials),
-    (error) => error.status === 501 && error.message.includes("Windows DPAPI"),
-  );
+  const linuxRoot = path.join(tempRoot, "linux");
+  const linuxStore = createCredentialStore({ platform: "linux", linuxRoot });
+  assert.deepEqual(await linuxStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+  await linuxStore.save(email, credentials);
+  assert.deepEqual(await linuxStore.load(email), credentials);
+
+  const restartedLinuxStore = createCredentialStore({ platform: "linux", linuxRoot });
+  assert.deepEqual(await restartedLinuxStore.load(email), credentials);
+
+  const linuxFiles = await fs.readdir(linuxRoot);
+  assert.deepEqual(linuxFiles.sort(), ["key", `${linuxStoreEmailId(email)}.enc`].sort());
+  const linuxCipherText = await fs.readFile(path.join(linuxRoot, `${linuxStoreEmailId(email)}.enc`), "utf8");
+  assert.equal(linuxCipherText.includes(credentials.password), false);
+  assert.equal(linuxCipherText.includes(credentials.proxyUrl), false);
+  if (process.platform !== "win32") {
+    const keyStat = await fs.stat(path.join(linuxRoot, "key"));
+    assert.equal(keyStat.mode & 0o777, 0o600);
+  }
+
+  await linuxStore.delete(email);
+  assert.deepEqual(await linuxStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
+}
+
+function linuxStoreEmailId(email) {
+  return crypto.createHash("sha256").update(String(email).trim().toLowerCase()).digest("hex");
 }
 
 console.log("credential store tests passed");

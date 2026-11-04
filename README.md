@@ -42,7 +42,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 - Python 3.9 或更高版本；默认协议登录流程需要安装 `curl_cffi`（浏览器 TLS 指纹请求库），即使不使用代理也需要。
 - macOS 使用 Keychain（钥匙串）持久保存密码、2FA 密钥和账号代理。
 - Windows 使用当前用户的 DPAPI（数据保护接口）加密保存上述数据，密文位于 `%LOCALAPPDATA%\toSub2\credentials`，只能由同一个 Windows 用户解密。
-- Linux 仍可使用邮箱验证码流程，但目前不持久保存密码、2FA 密钥和账号代理；服务重启后不会让原本配置代理的排队任务悄悄改用本机网络。
+- Linux 使用本地密钥加密凭据文件，持久保存密码、2FA 密钥和账号代理；密文与密钥默认位于 `tmp/chatgpt-onboarding-console/credentials`（或 `ONBOARDING_OUTPUT_ROOT` 指定目录），密钥文件权限为 `0600`。
 
 ## 安装与启动
 
@@ -266,6 +266,7 @@ node src/protocol-login.mjs --help
 
 - `tmp/` 中包含 Cookie（登录凭证）、OAuth Token（授权令牌）和登录检查点，禁止提交或分享。
 - Windows 保存的密码和 2FA 密钥由 DPAPI（数据保护接口）按当前用户加密，不会以明文写入任务目录。
+- Linux 保存的密码、2FA 密钥和代理使用本地密钥加密，密钥文件权限为 `0600`；凭据文件与密钥都应视为敏感文件。
 - sub2api 导入文件包含可用的授权令牌，应当按密码文件保护。
 - 不要把 API Key、密码、2FA 密钥、验证码、Cookie 或 Token 提交到 Git 仓库。
 - 网页控制台用于本机或可信局域网，不提供公网部署所需的身份认证。

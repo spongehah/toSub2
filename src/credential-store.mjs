@@ -3,8 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
 const WINDOWS_ENTROPY = "toSub2.credentials.v1";
 const MAX_CONCURRENT_CREDENTIAL_PROCESSES = 8;
@@ -45,8 +47,47 @@ export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
+  const linuxRoot = path.resolve(options.linuxRoot || process.env.TOSUB2_LINUX_CREDENTIAL_ROOT || defaultLinuxCredentialRoot());
   const securityRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.securityRunner || runSecurity);
   const powerShellRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.powerShellRunner || runPowerShell);
+  let linuxKeyPromise = null;
+
+  async function readLinuxKey() {
+    try {
+      const raw = await fs.readFile(linuxKeyPath(linuxRoot), "utf8");
+      const key = Buffer.from(raw.trim(), "base64");
+      if (key.length !== 32) throw credentialError(500, "Linux 凭据密钥文件格式不正确");
+      return key;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  function getOrCreateLinuxKey() {
+    if (linuxKeyPromise) return linuxKeyPromise;
+    const promise = (async () => {
+      const existing = await readLinuxKey();
+      if (existing) return existing;
+      await fs.mkdir(linuxRoot, { recursive: true, mode: 0o700 });
+      const key = crypto.randomBytes(32);
+      try {
+        await fs.writeFile(linuxKeyPath(linuxRoot), `${key.toString("base64")}\n`, { mode: 0o600, flag: "wx" });
+        return key;
+      } catch (error) {
+        if (error?.code === "EEXIST") {
+          const raced = await readLinuxKey();
+          if (raced) return raced;
+        }
+        throw credentialError(500, `无法写入 Linux 凭据密钥：${error.message}`);
+      }
+    })();
+    linuxKeyPromise = promise;
+    promise.catch(() => {
+      if (linuxKeyPromise === promise) linuxKeyPromise = null;
+    });
+    return promise;
+  }
 
   return {
     async save(email, credentials) {
@@ -75,7 +116,11 @@ export function createCredentialStore(options = {}) {
         await fs.writeFile(filePath, `${result.stdout.trim()}\n`, { mode: 0o600 });
         return;
       }
-      throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
+      if (platform === "linux") {
+        await saveLinuxCredential(linuxRoot, email, payload, getOrCreateLinuxKey);
+        return;
+      }
+      throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）、Windows DPAPI（数据保护接口）和 Linux 本地加密文件");
     },
 
     async load(email) {
@@ -96,6 +141,9 @@ export function createCredentialStore(options = {}) {
         } catch {
           return emptyCredentials();
         }
+      }
+      if (platform === "linux") {
+        return loadLinuxCredential(linuxRoot, email, readLinuxKey);
       }
       return emptyCredentials();
     },
@@ -123,6 +171,16 @@ export function createCredentialStore(options = {}) {
             throw credentialError(500, "无法删除 Windows DPAPI（数据保护接口）凭据文件");
           }
         }
+        return;
+      }
+      if (platform === "linux") {
+        try {
+          await fs.unlink(linuxCredentialPath(linuxRoot, email));
+        } catch (error) {
+          if (error?.code !== "ENOENT") {
+            throw credentialError(500, "无法删除 Linux 加密凭据文件");
+          }
+        }
       }
     },
   };
@@ -131,6 +189,58 @@ export function createCredentialStore(options = {}) {
 function defaultWindowsCredentialRoot() {
   const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
   return path.join(localAppData, "toSub2", "credentials");
+}
+
+function defaultLinuxCredentialRoot() {
+  const outputRoot = process.env.ONBOARDING_OUTPUT_ROOT
+    ? path.resolve(process.env.ONBOARDING_OUTPUT_ROOT)
+    : path.join(PROJECT_ROOT, "tmp", "chatgpt-onboarding-console");
+  return path.join(outputRoot, "credentials");
+}
+
+function linuxKeyPath(root) {
+  return path.join(root, "key");
+}
+
+function linuxCredentialPath(root, email) {
+  const id = crypto.createHash("sha256").update(credentialAccount(email)).digest("hex");
+  return path.join(root, `${id}.enc`);
+}
+
+async function saveLinuxCredential(root, email, payload, getKey) {
+  const key = await getKey();
+  const encrypted = encryptCredentialPayload(key, payload);
+  const filePath = linuxCredentialPath(root, email);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, `${JSON.stringify(encrypted)}\n`, { mode: 0o600 });
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw credentialError(500, `无法写入 Linux 加密凭据文件：${error.message}`);
+  }
+}
+
+async function loadLinuxCredential(root, email, readKey) {
+  let encrypted;
+  try {
+    encrypted = JSON.parse(await fs.readFile(linuxCredentialPath(root, email), "utf8"));
+  } catch {
+    return emptyCredentials();
+  }
+  let key;
+  try {
+    key = await readKey();
+  } catch {
+    return emptyCredentials();
+  }
+  if (!key) return emptyCredentials();
+  try {
+    return parseCredentialPayload(decryptCredentialPayload(key, encrypted));
+  } catch {
+    return emptyCredentials();
+  }
 }
 
 function windowsCredentialPath(root, email) {
