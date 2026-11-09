@@ -37,7 +37,7 @@ const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
-const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
+const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 2 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
@@ -2965,7 +2965,7 @@ function scheduleSub2ApiMonitor() {
   if (!sub2ApiMonitorConfig?.enabled || shuttingDown) return;
   const interval = Number.isFinite(SUB2API_MONITOR_INTERVAL_MS) && SUB2API_MONITOR_INTERVAL_MS >= 1_000
     ? SUB2API_MONITOR_INTERVAL_MS
-    : 5 * 60_000;
+    : 2 * 60_000;
   sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();
   sub2ApiMonitorTimer = setInterval(() => {
     sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();

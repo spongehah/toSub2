@@ -123,7 +123,7 @@ function App() {
     nextCheckAt: null,
     lastError: null,
     lastResult: null,
-    intervalMinutes: 5,
+    intervalMinutes: 2,
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
@@ -1657,7 +1657,7 @@ function App() {
                     onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, monitorEnabled: event.target.checked }))}
                   />
                   <span>
-                    <strong>每 5 分钟监控异常账号</strong>
+                    <strong>每 {sub2apiMonitorStatus.intervalMinutes || 2} 分钟监控异常账号</strong>
                     <small>只自动处理上次完整登录未人工输入密码、邮箱码或登录 2FA 的任务</small>
                   </span>
                 </label>
