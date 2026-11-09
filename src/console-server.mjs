@@ -2624,10 +2624,10 @@ function normalizeSub2ApiConfig(value) {
     return Number(value);
   });
   const proxyText = String(config.proxyId || "").trim();
-  if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
+  if (proxyText && proxyText !== "0" && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
     throw httpError(400, "代理 ID 无效");
   }
-  const proxyId = proxyText ? Number(proxyText) : 0;
+  const proxyId = proxyText && proxyText !== "0" ? Number(proxyText) : 0;
   const concurrency = parseOptionalSub2ApiInteger(config.concurrency, "并发数", 0, 10000);
   const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
   const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
@@ -2937,7 +2937,7 @@ function publicSub2ApiMonitorState() {
     baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
     adminApiKeyConfigured: Boolean(sub2ApiMonitorConfig?.adminApiKey),
     groupIds: sub2ApiMonitorConfig?.groupIds || [],
-    proxyId: sub2ApiMonitorConfig?.proxyId ?? null,
+    proxyId: sub2ApiMonitorConfig?.proxyId || null,
     concurrency: sub2ApiMonitorConfig?.concurrency ?? null,
     loadFactor: sub2ApiMonitorConfig?.loadFactor ?? null,
     priority: sub2ApiMonitorConfig?.priority ?? null,

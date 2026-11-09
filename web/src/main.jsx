@@ -281,7 +281,7 @@ function App() {
               sub2apiSettingsMigratedRef.current = true;
               void apiFetch(token, "/api/sub2api/monitor", {
                 method: "POST",
-                body: JSON.stringify({ enabled: Boolean(data.enabled), config: local }),
+                body: JSON.stringify({ enabled: local.monitorEnabled === true, config: local }),
               }).catch(() => {});
             }
           }
@@ -2731,11 +2731,12 @@ function normalizeSub2ApiSettings(value) {
     : String(stored.groupId || "").trim()
       ? [stored.groupId]
       : [];
+  const rawProxyId = String(stored.proxyId ?? "").trim();
   return {
     baseUrl: String(stored.baseUrl || ""),
     adminApiKey: String(stored.adminApiKey || ""),
     groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
-    proxyId: String(stored.proxyId ?? ""),
+    proxyId: /^\d+$/.test(rawProxyId) && Number(rawProxyId) > 0 ? rawProxyId : "",
     concurrency: String(stored.concurrency ?? ""),
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
