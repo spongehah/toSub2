@@ -380,6 +380,14 @@ function App() {
       setSub2apiSettingsError("请填写 1 到 10080 之间的新账号限流判定窗口（分钟）");
       return;
     }
+    const planWindowLines = String(sub2apiSettingsDraft.planMonitorWindows || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (const line of planWindowLines) {
+      const match = /^([a-z0-9_-]{1,64})\s*=\s*(\d{1,5})$/i.exec(line);
+      if (!match || Number(match[2]) < 1 || Number(match[2]) > 8760) {
+        setSub2apiSettingsError(`巡查窗口格式不正确：${line.slice(0, 80)}，请写成 plan_type=小时（1 到 8760）`);
+        return;
+      }
+    }
     const nextSettings = {
       ...readSub2ApiSettings(sub2apiSettingsDraft),
       baseUrl: baseUrl.replace(/\/+$/, ""),
@@ -1722,8 +1730,19 @@ function App() {
                   placeholder="例如 30"
                 />
               </label>
+              <label className="settings-field wide-settings-field">
+                <span>按 plan_type 的巡检窗口（小时）</span>
+                <textarea
+                  className="sub2api-model-textarea"
+                  value={sub2apiSettingsDraft.planMonitorWindows}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, planMonitorWindows: event.target.value }))}
+                  placeholder={"只巡检创建后指定小时内的账号，读取 credentials.plan_type 区分；default 为未匹配时的默认窗口，留空表示不限制\n例如：\ndefault=24\nplus=6\npro=12"}
+                  rows="4"
+                  spellCheck="false"
+                />
+              </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -2431,6 +2450,7 @@ function formatMonitorResult(result) {
   if (result.missingTask) parts.push(`本地无任务 ${result.missingTask} 条`);
   if (result.busy) parts.push(`正在运行 ${result.busy} 条`);
   if (result.cooldown) parts.push(`冷却中 ${result.cooldown} 条`);
+  if (result.outsideWindow) parts.push(`创建时间窗外 ${result.outsideWindow} 条`);
   return parts.join("，");
 }
 
@@ -2652,6 +2672,7 @@ function normalizeSub2ApiSettings(value) {
     modelWhitelist: String(stored.modelWhitelist || ""),
     rateLimitModels: String(stored.rateLimitModels || ""),
     rateLimitMinutes: String(stored.rateLimitMinutes ?? ""),
+    planMonitorWindows: String(stored.planMonitorWindows || ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",

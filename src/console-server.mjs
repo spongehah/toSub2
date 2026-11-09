@@ -2610,11 +2610,12 @@ function normalizeSub2ApiConfig(value) {
   if (rateLimitModels.length && rateLimitMinutes === null) {
     throw httpError(400, "填写限流模型后请设置新账号限流判定窗口（分钟）");
   }
+  const planMonitorWindows = parseSub2ApiPlanMonitorWindows(config.planMonitorWindows);
   const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, codexFingerprintMode };
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, planMonitorWindows, codexFingerprintMode };
 }
 
 function readDurationEnv(name, fallback, minimum) {
@@ -2641,6 +2642,26 @@ function parseSub2ApiModelWhitelist(value) {
   if (models.length > 200) throw httpError(400, "支持模型最多填写 200 个");
   if (models.some((model) => model.length > 200 || /[\r\n]/.test(model))) throw httpError(400, "支持模型名称格式不正确");
   return [...new Set(models)];
+}
+
+function parseSub2ApiPlanMonitorWindows(value) {
+  // 每行一个 plan_type=小时，default 表示未匹配 plan_type 时的默认窗口；留空表示不限制创建时间
+  const windows = Object.create(null);
+  const lines = String(value || "")
+    .split(/[\r\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (lines.length > 100) throw httpError(400, "按 plan_type 的巡查窗口最多填写 100 行");
+  for (const line of lines) {
+    const match = /^([a-z0-9_-]{1,64})\s*=\s*(\d{1,5})$/i.exec(line);
+    if (!match) throw httpError(400, `巡查窗口格式不正确：${line.slice(0, 80)}，请写成 plan_type=小时`);
+    const hours = Number(match[2]);
+    if (!Number.isSafeInteger(hours) || hours < 1 || hours > 8760) {
+      throw httpError(400, "巡查窗口小时数必须是 1 到 8760 之间的整数");
+    }
+    windows[match[1].toLowerCase()] = hours;
+  }
+  return windows;
 }
 
 function requestSub2Api(config, endpoint, options = {}) {
@@ -2804,6 +2825,7 @@ async function persistSub2ApiMonitorConfiguration() {
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
       rateLimitModels: sub2ApiMonitorConfig.rateLimitModels,
       rateLimitMinutes: sub2ApiMonitorConfig.rateLimitMinutes,
+      planMonitorWindows: sub2ApiMonitorConfig.planMonitorWindows,
       codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
     },
     state: {
@@ -2873,6 +2895,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       busy: 0,
       cooldown: 0,
       outsideGroups: 0,
+      outsideWindow: 0,
       missingEmail: 0,
     };
     try {
@@ -2885,6 +2908,10 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       for (const account of remoteAccounts) {
         if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
           summary.outsideGroups += 1;
+          continue;
+        }
+        if (!isSub2ApiAccountInMonitorWindow(account, config.planMonitorWindows)) {
+          summary.outsideWindow += 1;
           continue;
         }
         const email = sub2ApiAccountEmail(account);
@@ -3129,6 +3156,20 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
     ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
   ].map(Number).filter(Number.isSafeInteger);
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
+}
+
+function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows) {
+  // 未配置窗口时保持原有巡检行为；配置后按 credentials.plan_type 选择小时数，未匹配时使用 default
+  if (!planMonitorWindows || typeof planMonitorWindows !== "object") return true;
+  const planType = String(account?.credentials?.plan_type || "").trim().toLowerCase();
+  const hours = planType && Object.prototype.hasOwnProperty.call(planMonitorWindows, planType)
+    ? planMonitorWindows[planType]
+    : planMonitorWindows.default;
+  if (!Number.isFinite(hours) || hours <= 0) return true;
+  const createdAt = Date.parse(String(account?.created_at || ""));
+  if (!Number.isFinite(createdAt)) return false;
+  const ageMs = Date.now() - createdAt;
+  return ageMs >= 0 && ageMs <= hours * 3_600_000;
 }
 
 function monitorBackendIdentity(config) {
