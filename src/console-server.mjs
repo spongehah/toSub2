@@ -69,6 +69,8 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const CONSOLE_SETTINGS_FILENAME = "console-settings.json";
+const CONSOLE_SETTINGS_PATH = path.join(OUTPUT_ROOT, CONSOLE_SETTINGS_FILENAME);
 const TLS_PROFILE_SETTING_FILENAME = "tls-profile.json";
 const TLS_PROFILE_SETTING_PATH = path.join(OUTPUT_ROOT, TLS_PROFILE_SETTING_FILENAME);
 let tlsProfileSetting = null;
@@ -91,6 +93,11 @@ let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
+const consoleSettings = {
+  accountProxyUrl: "",
+  smsSettings: null,
+  mailRequestConfig: null,
+};
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
@@ -134,6 +141,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 
 await fsPromises.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadTlsProfileConfiguration();
+await loadConsoleSettings();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
@@ -290,9 +298,31 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "GET" && requestUrl.pathname === "/api/settings") {
+    sendJson(res, 200, publicConsoleSettings());
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/settings") {
+    const body = await readJson(req);
+    if (Object.hasOwn(body, "accountProxyUrl")) {
+      consoleSettings.accountProxyUrl = normalizeProxyUrl(body.accountProxyUrl) || "";
+    }
+    if (Object.hasOwn(body, "smsSettings")) {
+      const smsSettings = normalizeConsoleSmsSettings(body.smsSettings);
+      if (!smsSettings) throw httpError(400, "接码配置格式不正确");
+      consoleSettings.smsSettings = smsSettings;
+    }
+    await persistConsoleSettings();
+    sendJson(res, 200, publicConsoleSettings());
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/mail-request-config") {
     const body = await readJson(req);
     mailRequestConfig = normalizeMailRequestConfig(body.config);
+    consoleSettings.mailRequestConfig = mailRequestConfig;
+    await persistConsoleSettings();
     sendJson(res, 200, {
       config: {
         method: mailRequestConfig.method,
@@ -351,10 +381,10 @@ async function handleApi(req, res, requestUrl) {
       const existing = findJobByEmail(email);
       if (existing) {
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
-        else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
+        else if (hasProxyUpdate) await updateJobProxy(existing, resolveAccountProxyUrl(proxyUrl));
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
       }
-      return { job: await startJob(email, credentials, proxyUrl, { registerOnly }), created: true, updated: false };
+      return { job: await startJob(email, credentials, resolveAccountProxyUrl(proxyUrl), { registerOnly }), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -363,7 +393,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
-    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const proxyUrl = resolveAccountProxyUrl(body.proxyUrl);
     const registerOnly = body.registerOnly === true;
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
@@ -479,14 +509,14 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/groups") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
+    const config = resolveSub2ApiConfig(body.config);
     sendJson(res, 200, { groups: await listSub2ApiGroups(config) });
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/options") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
+    const config = resolveSub2ApiConfig(body.config);
     const [groups, proxyPayload] = await Promise.all([
       listSub2ApiGroups(config),
       requestSub2Api(config, "/api/v1/admin/proxies/all"),
@@ -511,7 +541,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
+    const config = resolveSub2ApiConfig(body.config);
     const selected = resolveSelectedJobs(body.ids);
     const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
@@ -559,7 +589,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/update") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
+    const config = resolveSub2ApiConfig(body.config);
     const selected = resolveSelectedJobs(body.ids);
     const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
@@ -608,12 +638,9 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
-    if (body.enabled) {
-      const config = normalizeSub2ApiConfig(body.config);
-      sub2ApiMonitorConfig = { ...config, enabled: true };
-    } else {
-      sub2ApiMonitorConfig = null;
-    }
+    // 关闭监控也保留配置，供其他设备读取和后续重新启用
+    const config = body.config ? resolveSub2ApiConfig(body.config) : sub2ApiMonitorConfig;
+    if (config) sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true };
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
@@ -1096,7 +1123,7 @@ async function retryJob(job, options = {}) {
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = resolveAccountProxyUrl(options.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
   }
   const resumingCheckpoint = job.status === "resume_available"
@@ -1146,7 +1173,7 @@ async function regenerateJob(job, options = {}) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = resolveAccountProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   job.lastError = null;
@@ -1178,7 +1205,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = resolveAccountProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1241,7 +1268,7 @@ async function reloadMissingJobCredentials(job) {
   const stored = await loadStoredLoginCredentials(job.email);
   job.password ||= stored.password;
   job.totpSecret ||= stored.totpSecret;
-  job.proxyUrl ||= stored.proxyUrl;
+  job.proxyUrl ||= stored.proxyUrl || consoleSettings.accountProxyUrl || null;
   if (job.password) job.hasPasswordCredential = true;
   if (job.totpSecret) job.hasTotpCredential = true;
   if (stored.password || stored.totpSecret || stored.proxyUrl) {
@@ -1265,7 +1292,7 @@ async function startTotpSetup(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = resolveAccountProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1306,7 +1333,7 @@ async function startPasswordAdd(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = resolveAccountProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -2618,6 +2645,15 @@ function normalizeSub2ApiConfig(value) {
   return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, planMonitorWindows, codexFingerprintMode };
 }
 
+function resolveSub2ApiConfig(value) {
+  // 其他设备无需拿到管理员密钥：未提交 Key 时沿用服务端已保存的配置
+  const config = value && typeof value === "object" ? { ...value } : {};
+  if (!String(config.adminApiKey || "").trim() && sub2ApiMonitorConfig?.adminApiKey) {
+    config.adminApiKey = sub2ApiMonitorConfig.adminApiKey;
+  }
+  return normalizeSub2ApiConfig(config);
+}
+
 function readDurationEnv(name, fallback, minimum) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
@@ -2788,6 +2824,60 @@ async function persistTlsProfileConfiguration() {
   await fsPromises.rename(tempPath, TLS_PROFILE_SETTING_PATH);
 }
 
+async function loadConsoleSettings() {
+  try {
+    const saved = JSON.parse(await fsPromises.readFile(CONSOLE_SETTINGS_PATH, "utf8"));
+    consoleSettings.accountProxyUrl = normalizeProxyUrl(saved.accountProxyUrl) || "";
+    consoleSettings.smsSettings = normalizeConsoleSmsSettings(saved.smsSettings ?? null);
+    consoleSettings.mailRequestConfig = saved.mailRequestConfig
+      ? normalizeMailRequestConfig(saved.mailRequestConfig)
+      : null;
+    if (consoleSettings.mailRequestConfig) mailRequestConfig = consoleSettings.mailRequestConfig;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] 控制台配置无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+  }
+}
+
+async function persistConsoleSettings() {
+  const payload = {
+    version: 1,
+    accountProxyUrl: consoleSettings.accountProxyUrl || "",
+    smsSettings: consoleSettings.smsSettings || null,
+    mailRequestConfig: consoleSettings.mailRequestConfig || null,
+    updatedAt: new Date().toISOString(),
+  };
+  const tempPath = `${CONSOLE_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fsPromises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fsPromises.rename(tempPath, CONSOLE_SETTINGS_PATH);
+}
+
+function publicConsoleSettings() {
+  return {
+    accountProxyUrl: consoleSettings.accountProxyUrl || "",
+    smsSettings: consoleSettings.smsSettings || null,
+    mailRequestConfig: consoleSettings.mailRequestConfig || null,
+  };
+}
+
+function normalizeConsoleSmsSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const configs = value.configs;
+  if (!configs || typeof configs !== "object" || Array.isArray(configs)) return null;
+  if (Buffer.byteLength(JSON.stringify(value)) > 512 * 1024) {
+    throw httpError(400, "接码配置内容过大");
+  }
+  return {
+    selectedProviderId: String(value.selectedProviderId || "").trim(),
+    configs,
+  };
+}
+
+function resolveAccountProxyUrl(value) {
+  return normalizeProxyUrl(value) || consoleSettings.accountProxyUrl || null;
+}
+
 async function loadSub2ApiMonitorConfiguration() {
   try {
     const saved = JSON.parse(await fsPromises.readFile(SUB2API_MONITOR_PATH, "utf8"));
@@ -2845,7 +2935,17 @@ function publicSub2ApiMonitorState() {
     configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
     enabled: Boolean(sub2ApiMonitorConfig?.enabled),
     baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
+    adminApiKeyConfigured: Boolean(sub2ApiMonitorConfig?.adminApiKey),
     groupIds: sub2ApiMonitorConfig?.groupIds || [],
+    proxyId: sub2ApiMonitorConfig?.proxyId ?? null,
+    concurrency: sub2ApiMonitorConfig?.concurrency ?? null,
+    loadFactor: sub2ApiMonitorConfig?.loadFactor ?? null,
+    priority: sub2ApiMonitorConfig?.priority ?? null,
+    modelWhitelist: sub2ApiMonitorConfig?.modelWhitelist || [],
+    rateLimitModels: sub2ApiMonitorConfig?.rateLimitModels || [],
+    rateLimitMinutes: sub2ApiMonitorConfig?.rateLimitMinutes ?? null,
+    planMonitorWindows: sub2ApiMonitorConfig?.planMonitorWindows || {},
+    codexFingerprintMode: sub2ApiMonitorConfig?.codexFingerprintMode || "session",
     intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
     cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
     running: sub2ApiMonitorState.running,
@@ -4758,7 +4858,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
         totpSecret: job.totpSecret,
       })
     : normalizeLoginCredentials(credentials);
-  const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
+  const nextProxyUrl = options.hasProxyUpdate ? resolveAccountProxyUrl(options.proxyUrl) : job.proxyUrl;
   const changed = job.loginMode !== normalized.loginMode
     || job.mailApiUrl !== normalized.mailApiUrl
     || job.mailRequestBody !== normalized.mailRequestBody

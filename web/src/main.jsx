@@ -112,9 +112,12 @@ function App() {
   const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
   const [sub2apiSettingsSaving, setSub2apiSettingsSaving] = useState(false);
   const [sub2apiMonitorChecking, setSub2apiMonitorChecking] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const sub2apiSettingsMigratedRef = useRef(false);
   const [sub2apiMonitorStatus, setSub2apiMonitorStatus] = useState({
     configured: false,
     enabled: false,
+    adminApiKeyConfigured: false,
     running: false,
     lastCheckAt: null,
     nextCheckAt: null,
@@ -195,12 +198,41 @@ function App() {
   }
 
   useEffect(() => {
-    if (!token) return;
-    void apiFetch(token, "/api/mail-request-config", {
-      method: "POST",
-      body: JSON.stringify({ config: buildMailRequestConfig(mailRequestSettings) }),
-    }).catch((requestError) => setError(requestError.message));
+    if (!token) return undefined;
+    // 配置以服务端为准：其他设备打开时从服务端恢复，并把本机旧配置迁移到服务端
+    let stopped = false;
+    const load = async () => {
+      try {
+        const data = await apiFetch(token, "/api/settings");
+        if (stopped) return;
+        const localProxy = readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY);
+        const localSms = readSmsProviderSettings();
+        const localMail = readMailRequestSettings();
+        if (data.accountProxyUrl) setAccountProxyUrl(data.accountProxyUrl);
+        else if (localProxy) await apiFetch(token, "/api/settings", { method: "POST", body: JSON.stringify({ accountProxyUrl: localProxy }) });
+        if (data.smsSettings) setSmsSettings(data.smsSettings);
+        else await apiFetch(token, "/api/settings", { method: "POST", body: JSON.stringify({ smsSettings: localSms }) }).catch(() => {});
+        if (data.mailRequestConfig) setMailRequestSettings(normalizeMailRequestSettings(data.mailRequestConfig));
+        else await apiFetch(token, "/api/mail-request-config", { method: "POST", body: JSON.stringify({ config: buildMailRequestConfig(localMail) }) }).catch(() => {});
+      } catch {}
+      if (!stopped) setSettingsLoaded(true);
+    };
+    void load();
+    return () => {
+      stopped = true;
+    };
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !settingsLoaded) return undefined;
+    const timer = window.setTimeout(() => {
+      void apiFetch(token, "/api/settings", {
+        method: "POST",
+        body: JSON.stringify({ accountProxyUrl: accountProxyUrl.trim() }),
+      }).catch(() => {});
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [token, settingsLoaded, accountProxyUrl]);
 
   useEffect(() => {
     if (!token) return undefined;
@@ -243,8 +275,36 @@ function App() {
       try {
         const data = await apiFetch(token, "/api/sub2api/monitor");
         if (!stopped) {
+          if (!data.configured && !sub2apiSettingsMigratedRef.current) {
+            const local = readSub2ApiSettings();
+            if (local.baseUrl && local.adminApiKey) {
+              sub2apiSettingsMigratedRef.current = true;
+              void apiFetch(token, "/api/sub2api/monitor", {
+                method: "POST",
+                body: JSON.stringify({ enabled: Boolean(data.enabled), config: local }),
+              }).catch(() => {});
+            }
+          }
           setSub2apiMonitorStatus(data);
-          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
+          setSub2apiSettings((current) => {
+            const merged = data.configured
+              ? normalizeSub2ApiSettings({
+                  ...current,
+                  baseUrl: data.baseUrl,
+                  groupIds: data.groupIds,
+                  proxyId: data.proxyId,
+                  concurrency: data.concurrency,
+                  loadFactor: data.loadFactor,
+                  priority: data.priority,
+                  modelWhitelist: data.modelWhitelist,
+                  rateLimitModels: data.rateLimitModels,
+                  rateLimitMinutes: data.rateLimitMinutes,
+                  planMonitorWindows: data.planMonitorWindows,
+                  codexFingerprintMode: data.codexFingerprintMode,
+                })
+              : current;
+            return { ...merged, monitorEnabled: Boolean(data.enabled) };
+          });
         }
       } catch {}
     };
@@ -278,6 +338,7 @@ function App() {
     () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
     [smsProviderDefinitions, smsSettingsDraft],
   );
+  const sub2ApiKeyConfigured = Boolean(sub2apiSettings.adminApiKey || sub2apiMonitorStatus.adminApiKeyConfigured);
   const selectedJobs = useMemo(
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
@@ -370,7 +431,7 @@ function App() {
       setSub2apiSettingsError("请输入 http:// 或 https:// 开头的 Sub2API 后端地址");
       return;
     }
-    if (!adminApiKey) {
+    if (!adminApiKey && !sub2apiMonitorStatus.adminApiKeyConfigured) {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
       return;
     }
@@ -437,7 +498,7 @@ function App() {
   }
 
   async function uploadSelected(ids) {
-    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
+    if (!sub2apiSettings.baseUrl || !sub2ApiKeyConfigured) {
       openSub2ApiSettings();
       setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
       return;
@@ -464,7 +525,7 @@ function App() {
   }
 
   async function updateSub2ApiSelected(ids) {
-    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
+    if (!sub2apiSettings.baseUrl || !sub2ApiKeyConfigured) {
       openSub2ApiSettings();
       setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
       return;
@@ -533,7 +594,7 @@ function App() {
     }));
   }
 
-  function saveSmsSettings(event) {
+  async function saveSmsSettings(event) {
     event.preventDefault();
     const resolved = resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft);
     if (!resolved.definition) {
@@ -554,9 +615,18 @@ function App() {
         return;
       }
     }
-    setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
-    setSmsSettingsOpen(false);
-    setSmsSettingsError("");
+    const nextSettings = withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft);
+    try {
+      await apiFetch(token, "/api/settings", {
+        method: "POST",
+        body: JSON.stringify({ smsSettings: nextSettings }),
+      });
+      setSmsSettings(nextSettings);
+      setSmsSettingsOpen(false);
+      setSmsSettingsError("");
+    } catch (requestError) {
+      setSmsSettingsError(requestError.message);
+    }
   }
 
   useEffect(() => {
@@ -1053,9 +1123,9 @@ function App() {
         <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
           <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
           <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
-          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
-            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
-            {sub2apiSettings.adminApiKey
+          <span className={`provider-ready ${sub2ApiKeyConfigured ? "" : "incomplete"}`}>
+            {sub2ApiKeyConfigured ? <Check size={14} /> : <CircleAlert size={14} />}
+            {sub2ApiKeyConfigured
               ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
               : "未完成配置"}
           </span>
@@ -1301,7 +1371,7 @@ function App() {
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     onSub2Update={() => updateSub2ApiSelected([job.id])}
-                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2ApiKeyConfigured)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
@@ -1598,7 +1668,7 @@ function App() {
                   type="password"
                   value={sub2apiSettingsDraft.adminApiKey}
                   onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, adminApiKey: event.target.value }))}
-                  placeholder="输入 sub2api 管理员 API Key"
+                  placeholder={sub2apiMonitorStatus.adminApiKeyConfigured ? "服务端已配置，留空保持不变" : "输入 sub2api 管理员 API Key"}
                   autoComplete="off"
                 />
               </label>
@@ -1742,7 +1812,7 @@ function App() {
                 />
               </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口。</div>
+            <div className="dialog-hint">配置保存在服务端，其他设备打开后会自动同步；管理员 API Key 保存后不再回显，留空保存会沿用服务端已保存的 Key。分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -2665,19 +2735,24 @@ function normalizeSub2ApiSettings(value) {
     baseUrl: String(stored.baseUrl || ""),
     adminApiKey: String(stored.adminApiKey || ""),
     groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
-    proxyId: String(stored.proxyId || ""),
+    proxyId: String(stored.proxyId ?? ""),
     concurrency: String(stored.concurrency ?? ""),
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
-    modelWhitelist: String(stored.modelWhitelist || ""),
-    rateLimitModels: String(stored.rateLimitModels || ""),
+    modelWhitelist: Array.isArray(stored.modelWhitelist) ? stored.modelWhitelist.join("\n") : String(stored.modelWhitelist || ""),
+    rateLimitModels: Array.isArray(stored.rateLimitModels) ? stored.rateLimitModels.join("\n") : String(stored.rateLimitModels || ""),
     rateLimitMinutes: String(stored.rateLimitMinutes ?? ""),
-    planMonitorWindows: String(stored.planMonitorWindows || ""),
+    planMonitorWindows: formatPlanMonitorWindowsSetting(stored.planMonitorWindows),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",
     monitorEnabled: stored.monitorEnabled === true,
   };
+}
+
+function formatPlanMonitorWindowsSetting(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return String(value || "");
+  return Object.entries(value).map(([planType, hours]) => `${planType}=${hours}`).join("\n");
 }
 
 function readSub2ApiSettings(value) {
