@@ -71,6 +71,8 @@ const OUTPUT_ROOT = path.resolve(
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const CONSOLE_SETTINGS_FILENAME = "console-settings.json";
 const CONSOLE_SETTINGS_PATH = path.join(OUTPUT_ROOT, CONSOLE_SETTINGS_FILENAME);
+const CONSOLE_API_KEY_FILENAME = "console-api-key.json";
+const CONSOLE_API_KEY_PATH = path.join(OUTPUT_ROOT, CONSOLE_API_KEY_FILENAME);
 const TLS_PROFILE_SETTING_FILENAME = "tls-profile.json";
 const TLS_PROFILE_SETTING_PATH = path.join(OUTPUT_ROOT, TLS_PROFILE_SETTING_FILENAME);
 let tlsProfileSetting = null;
@@ -98,6 +100,7 @@ const consoleSettings = {
   smsSettings: null,
   mailRequestConfig: null,
 };
+let consoleApiKey = "";
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
@@ -141,6 +144,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 
 await fsPromises.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadTlsProfileConfiguration();
+await loadConsoleApiKey();
 await loadConsoleSettings();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
@@ -270,14 +274,22 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  if (consolePassword && !readConsoleSession(req)) {
-    sendJson(res, 401, { error: "请先登录控制台" });
-    return;
-  }
+  const providedApiKey = readRequestApiKey(req);
+  if (providedApiKey) {
+    if (!hasValidExternalApiKey(req)) {
+      sendJson(res, 401, { error: "访问密钥无效" });
+      return;
+    }
+  } else {
+    if (consolePassword && !readConsoleSession(req)) {
+      sendJson(res, 401, { error: "请先登录控制台" });
+      return;
+    }
 
-  if (req.headers["x-console-token"] !== consoleToken) {
-    sendJson(res, 403, { error: "Invalid console token" });
-    return;
+    if (req.headers["x-console-token"] !== consoleToken) {
+      sendJson(res, 403, { error: "Invalid console token" });
+      return;
+    }
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
@@ -2822,6 +2834,48 @@ async function persistTlsProfileConfiguration() {
   const tempPath = `${TLS_PROFILE_SETTING_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fsPromises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   await fsPromises.rename(tempPath, TLS_PROFILE_SETTING_PATH);
+}
+
+async function loadConsoleApiKey() {
+  try {
+    const saved = JSON.parse(await fsPromises.readFile(CONSOLE_API_KEY_PATH, "utf8"));
+    if (isValidConsoleApiKey(saved.apiKey)) {
+      consoleApiKey = saved.apiKey;
+      return;
+    }
+    console.warn("[warn] 外部访问密钥文件格式无效，已重新生成");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] 外部访问密钥无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+  }
+  consoleApiKey = crypto.randomBytes(32).toString("base64url");
+  const payload = {
+    version: 1,
+    apiKey: consoleApiKey,
+    createdAt: new Date().toISOString(),
+  };
+  const tempPath = `${CONSOLE_API_KEY_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fsPromises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fsPromises.rename(tempPath, CONSOLE_API_KEY_PATH);
+  console.log(`[info] Generated external API key: ${CONSOLE_API_KEY_PATH}`);
+}
+
+function isValidConsoleApiKey(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{32,128}$/.test(value);
+}
+
+function readRequestApiKey(req) {
+  const direct = String(req.headers["x-api-key"] || "").trim();
+  if (direct) return direct;
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+  return match ? match[1].trim() : "";
+}
+
+function hasValidExternalApiKey(req) {
+  if (!consoleApiKey) return false;
+  const apiKey = readRequestApiKey(req);
+  return Boolean(apiKey) && safeEqualText(apiKey, consoleApiKey);
 }
 
 async function loadConsoleSettings() {

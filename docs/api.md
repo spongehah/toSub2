@@ -1,136 +1,28 @@
-# toSub2 外部调用 API 文档
-
-本文档面向通过外部服务调用 toSub2 控制台接口的场景，主要覆盖批量添加账号流程。
+# toSub2 批量提交账号 API
 
 Base URL：`http://127.0.0.1:4399`（可用 `--host`、`--port` 或环境变量修改）
 
-## 鉴权模型
+## 访问密钥
 
-除 `/api/bootstrap`、`/api/login`、`/api/logout` 外，所有 `/api/*` 接口都要求：
+服务启动时会自动生成随机访问密钥并持久化：
 
-- 设置了 `CONSOLE_PASSWORD` 时：携带登录返回的 `tosub2_session` Cookie。
-- 携带 `x-console-token: <token>` 请求头。
-
-`token` 为服务进程内的全局令牌，服务重启后会变化。设置了控制台密码时，Cookie 会话有效期为 12 小时。
-
-错误响应统一为：
-
-```json
-{ "error": "错误信息" }
+```text
+tmp/chatgpt-onboarding-console/console-api-key.json
 ```
 
-响应头包含 `content-type: application/json; charset=utf-8` 和 `cache-control: no-store`。服务未开启 CORS，只适合服务端到服务端调用。
+默认输出目录可通过 `ONBOARDING_OUTPUT_ROOT` 修改。文件权限为 `0600`，服务重启后会继续使用同一个密钥；删除该文件后重启服务会重新生成新密钥。
 
----
-
-## 1. GET /api/bootstrap
-
-获取控制台鉴权状态和全局 token。
-
-### 成功 200
-
-未设置密码，或 Cookie 会话有效：
-
-```json
-{
-  "authRequired": true,
-  "authenticated": true,
-  "token": "全局 console token",
-  "features": {
-    "retry": true,
-    "regenerate": true,
-    "bulkActions": true,
-    "smsProviders": [],
-    "sub2apiUpload": true,
-    "sub2apiMonitor": true,
-    "totpSetup": true,
-    "passwordAdd": true,
-    "forceRelogin": true
-  }
-}
-```
-
-设置了密码但未登录：
-
-```json
-{
-  "authRequired": true,
-  "authenticated": false
-}
-```
-
-### 失败
-
-该接口本身不鉴权，通常只有服务端内部异常：
-
-- `500`：`{"error":"Internal server error"}` 或具体异常信息。
-
----
-
-## 2. POST /api/login
-
-使用控制台密码换取 token 和会话 Cookie。
-
-### 请求
+调用接口时在请求头中携带：
 
 ```http
-POST /api/login
-content-type: application/json
-
-{ "password": "控制台密码" }
+x-api-key: <访问密钥>
 ```
 
-未设置 `CONSOLE_PASSWORD` 时，请求体可为空，直接返回 token。
-
-### 成功 200
-
-```json
-{
-  "token": "全局 console token",
-  "features": { "...": "同 bootstrap" }
-}
-```
-
-同时返回：
-
-```http
-Set-Cookie: tosub2_session=<session>; HttpOnly; Path=/; SameSite=Strict; Max-Age=43200
-```
-
-设置了 `CONSOLE_PASSWORD` 时，后续请求需要同时带 Cookie 和 `x-console-token`。
-
-### 失败
-
-| 状态码 | 场景 | 响应 |
-|---|---|---|
-| 400 | 请求体不是合法 JSON | `{"error":"Invalid JSON body"}` |
-| 401 | 密码为空或错误 | `{"error":"控制台密码错误"}` |
-| 413 | 请求体超过 1,000,000 字符 | `{"error":"Request body is too large"}` |
-| 500 | 内部异常 | `{"error":"..."}` |
+也支持 `Authorization: Bearer <访问密钥>`。访问密钥等同于管理员权限，请妥善保管。
 
 ---
 
-## 3. POST /api/logout
-
-注销当前 Cookie 会话。不需要 `x-console-token`。
-
-### 成功 200
-
-```json
-{ "ok": true }
-```
-
-同时清除 `tosub2_session` Cookie。
-
-### 失败
-
-| 状态码 | 场景 | 响应 |
-|---|---|---|
-| 401 | 设置了密码且当前会话无效 | `{"error":"请先登录控制台"}` |
-
----
-
-## 4. POST /api/jobs/batch
+## POST /api/jobs/batch
 
 批量添加账号，同时会更新已存在的同邮箱任务。
 
@@ -138,8 +30,7 @@ Set-Cookie: tosub2_session=<session>; HttpOnly; Path=/; SameSite=Strict; Max-Age
 
 ```http
 content-type: application/json
-cookie: tosub2_session=...
-x-console-token: <token>
+x-api-key: <访问密钥>
 ```
 
 ### 请求体
@@ -234,10 +125,9 @@ email@example.com----密码----2FA密钥----编码后的请求体
 
 | 状态码 | 场景 | 响应 |
 |---|---|---|
+| 401 | 访问密钥缺失或错误 | `{"error":"访问密钥无效"}` |
 | 400 | 请求体不是合法 JSON | `{"error":"Invalid JSON body"}` |
 | 413 | 请求体超过 1,000,000 字符 | `{"error":"Request body is too large"}` |
-| 401 | 设置了密码但 Cookie 会话无效 | `{"error":"请先登录控制台"}` |
-| 403 | token 缺失或错误 | `{"error":"Invalid console token"}` |
 | 400 | text 为空 | `{"error":"请至少输入一行账号信息"}` |
 | 400 | 超过 500 行 | `{"error":"一次最多添加 500 条任务"}` |
 | 400 | POST 接码模式未配置统一 URL | `{"error":"POST 邮件接码模式需要先在控制台配置统一请求 URL"}` |
@@ -261,26 +151,11 @@ email@example.com----密码----2FA密钥----编码后的请求体
 
 ## 完整调用示例
 
-### 已设置 CONSOLE_PASSWORD
-
 ```bash
-TOKEN=$(curl -c cookie.txt -s http://127.0.0.1:4399/api/login \
-  -H 'content-type: application/json' \
-  -d '{"password":"控制台密码"}' | jq -r .token)
-
-curl -b cookie.txt -s -D - http://127.0.0.1:4399/api/jobs/batch \
-  -H 'content-type: application/json' \
-  -H "x-console-token: $TOKEN" \
-  -d '{"text":"a@example.com----密码\nb@example.com","registerOnly":false}'
-```
-
-### 未设置 CONSOLE_PASSWORD
-
-```bash
-TOKEN=$(curl -s http://127.0.0.1:4399/api/bootstrap | jq -r .token)
+API_KEY=$(jq -r .apiKey tmp/chatgpt-onboarding-console/console-api-key.json)
 
 curl -s -D - http://127.0.0.1:4399/api/jobs/batch \
   -H 'content-type: application/json' \
-  -H "x-console-token: $TOKEN" \
-  -d '{"text":"a@example.com----密码\nb@example.com"}'
+  -H "x-api-key: $API_KEY" \
+  -d '{"text":"a@example.com----密码\nb@example.com","registerOnly":false}'
 ```
