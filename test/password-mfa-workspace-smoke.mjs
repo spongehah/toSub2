@@ -76,6 +76,7 @@ try {
     "--checkpoint", emailCheckpointPath,
     "--verbose",
   ], {
+    CHATGPT_LOGIN_PASSWORD: "",
     CHATGPT_TOTP_SECRET: "JBSWY3DPEHPK3PXP",
   }, [{ pattern: /Email OTP \(r=resend/, value: "123456" }]);
 
@@ -164,6 +165,71 @@ try {
   assert.equal(setupResult.secret, "NB2W45DFOIZAQWER");
   assert.equal(setupResult.activation_mode, "automatic");
   assert.equal(setupResult.activation_succeeded, true);
+
+  // Keep new cases after the existing cumulative workspace-count assertions.
+  const stateBeforeEmailFirst = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  const emailFirstOutputPath = path.join(tempRoot, "email-first-sub2api-import-oauth.json");
+  const emailFirstLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "email-first-password@example.com",
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--output-mode", "sub2api",
+    "--sub2api-out", emailFirstOutputPath,
+    "--checkpoint", path.join(tempRoot, "email-first-login-checkpoint.json"),
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+    CHATGPT_TOTP_SECRET: "JBSWY3DPEHPK3PXP",
+  });
+  assert.equal(emailFirstLogin.code, 0, processFailure(emailFirstLogin));
+  assert.match(emailFirstLogin.output, /Auth page: .*\/email-verification/);
+  assert.match(emailFirstLogin.output, /Password login page reached/);
+  assert.match(emailFirstLogin.output, /\[ok\] Password accepted/);
+  assert.match(emailFirstLogin.output, /\[ok\] 2FA verification accepted/);
+  assert.match(emailFirstLogin.output, /\[web\] Select ChatGPT login workspace/);
+  assert.doesNotMatch(emailFirstLogin.output, /Email OTP \(/);
+  const stateAfterEmailFirst = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  assert.equal(stateAfterEmailFirst.emailVerificationPageCount, 1);
+  assert.equal(stateAfterEmailFirst.passwordPageRequestCount, 1);
+  assert.equal(stateAfterEmailFirst.passwordPageReferer, `${baseUrl}/email-verification`);
+  assert.equal(stateAfterEmailFirst.passwordPageReached, true);
+  assert.equal(stateAfterEmailFirst.passwordVerifyCount, 1);
+  assert.equal(stateAfterEmailFirst.emailOtpValidateCount, 0);
+  assert.equal(stateAfterEmailFirst.chatgptLoginComplete, true);
+  assert.equal(stateAfterEmailFirst.chatgptWorkspaceSelected, true);
+  assert.equal(stateAfterEmailFirst.workspaceSelectionCount, stateBeforeEmailFirst.workspaceSelectionCount + 2);
+  const emailFirstExport = JSON.parse(await fs.readFile(emailFirstOutputPath, "utf8"));
+  assert.equal(emailFirstExport.accounts?.[0]?.credentials?.email, "email-first-password@example.com");
+
+  const redirectedOutputPath = path.join(tempRoot, "redirected-sub2api-import-oauth.json");
+  const redirectedPasswordLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "password-redirect-email@example.com",
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--output-mode", "sub2api",
+    "--sub2api-out", redirectedOutputPath,
+    "--checkpoint", path.join(tempRoot, "redirected-login-checkpoint.json"),
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+    CHATGPT_TOTP_SECRET: "JBSWY3DPEHPK3PXP",
+  });
+  assert.notEqual(redirectedPasswordLogin.code, 0, "redirecting back to email verification must fail");
+  assert.match(redirectedPasswordLogin.output, /PASSWORD_LOGIN_UNAVAILABLE/);
+  assert.doesNotMatch(redirectedPasswordLogin.output, /Password login page reached|Email OTP \(/);
+  const stateAfterRedirect = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  assert.equal(stateAfterRedirect.emailVerificationPageCount, 2);
+  assert.equal(stateAfterRedirect.passwordPageRequestCount, 1);
+  assert.equal(stateAfterRedirect.passwordPageReferer, `${baseUrl}/email-verification`);
+  assert.equal(stateAfterRedirect.passwordPageReached, false);
+  assert.equal(stateAfterRedirect.passwordVerifyCount, 0);
+  assert.equal(stateAfterRedirect.emailOtpValidateCount, 0);
+  assert.equal(stateAfterRedirect.chatgptLoginComplete, false);
+  assert.equal(stateAfterRedirect.chatgptWorkspaceSelected, false);
+  assert.equal(stateAfterRedirect.workspaceSelectionCount, stateAfterEmailFirst.workspaceSelectionCount);
+  await assert.rejects(fs.access(redirectedOutputPath), { code: "ENOENT" });
   console.log("password/email OTP + 2FA workspace smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nMock server output:\n${serverLogs}`;

@@ -1024,10 +1024,19 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
   if (!signin.url) throw new Error("signin/openai did not return url");
 
   const authRequestStartedAt = new Date().toISOString();
-  const authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
+  let authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
   console.log(`[info] Auth page: ${safeUrl(authPage.finalUrl)}`);
   if (authPage.last?.text) {
     console.log(`[info] Page text: ${summarizeHtml(authPage.last.text)}`);
+  }
+
+  // Mirror the official "Continue with password" choice when a password is supplied.
+  if (password && isEmailVerificationPage(authPage.finalUrl)) {
+    console.log("[info] Email verification page reached; continuing with configured password.");
+    authPage = await client.follow(`${authBase}/log-in/password`, { referer: authPage.finalUrl });
+    if (!isPasswordLoginPage(authPage.finalUrl)) {
+      throw new Error("PASSWORD_LOGIN_UNAVAILABLE: 未能进入密码登录页面，已停止自动登录");
+    }
   }
 
   let authenticated;

@@ -15,6 +15,12 @@ let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
 let totpEnabled = false;
 let passwordVerifySentinelCount = 0;
+let passwordPageReached = false;
+let passwordPageRequestCount = 0;
+let passwordPageReferer = null;
+let emailVerificationPageCount = 0;
+let passwordVerifyCount = 0;
+let emailOtpValidateCount = 0;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -41,20 +47,43 @@ const server = http.createServer(async (req, res) => {
       chatgptWorkspaceSelected,
       workspaceSelectionCount,
       passwordVerifySentinelCount,
+      passwordPageReached,
+      passwordPageRequestCount,
+      passwordPageReferer,
+      emailVerificationPageCount,
+      passwordVerifyCount,
+      emailOtpValidateCount,
     });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     chatgptWorkspaceSelected = false;
     chatgptLoginComplete = false;
+    passwordPageReached = false;
+    passwordPageRequestCount = 0;
+    passwordPageReferer = null;
+    emailVerificationPageCount = 0;
+    passwordVerifyCount = 0;
+    emailOtpValidateCount = 0;
     selectedEmail = url.searchParams.get("login_hint") || selectedEmail;
-    const passwordMode = selectedEmail !== "email-mfa@example.com";
+    const passwordMode = !["email-mfa@example.com", "email-first-password@example.com", "password-redirect-email@example.com"].includes(selectedEmail);
     return sendJson(res, 200, { url: `${base}/api/accounts/authorize?mode=${passwordMode ? "password" : "email"}` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
     return redirect(res, `${base}${url.searchParams.get("mode") === "email" ? "/email-verification" : "/log-in/password"}`);
   }
-  if (req.method === "GET" && ["/log-in/password", "/email-verification"].includes(url.pathname)) {
-    return sendText(res, 200, `<html><title>${url.pathname === "/log-in/password" ? "Enter password" : "Check inbox"}</title></html>`, "text/html");
+  if (req.method === "GET" && url.pathname === "/log-in/password") {
+    passwordPageRequestCount += 1;
+    passwordPageReferer = req.headers.referer || null;
+    if (["email-first-password@example.com", "password-redirect-email@example.com"].includes(selectedEmail)) {
+      if (passwordPageReferer !== `${base}/email-verification`) return sendText(res, 400, "missing email page referer");
+      if (selectedEmail === "password-redirect-email@example.com") return redirect(res, `${base}/email-verification`);
+    }
+    passwordPageReached = true;
+    return sendText(res, 200, "<html><title>Enter password</title></html>", "text/html");
+  }
+  if (req.method === "GET" && url.pathname === "/email-verification") {
+    emailVerificationPageCount += 1;
+    return sendText(res, 200, '<html><title>Check inbox</title><a href="/log-in/password">Continue with password</a></html>', "text/html");
   }
   if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
     const payload = parseJson(body);
@@ -69,14 +98,17 @@ const server = http.createServer(async (req, res) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/password/verify") {
+    passwordVerifyCount += 1;
     const payload = parseJson(body);
-    if (!hasPasswordVerifySentinel(req) || payload.password !== password || Object.keys(payload).length !== 1) {
+    // Accept credentials only after a successful GET of the password page.
+    if (!passwordPageReached || !hasPasswordVerifySentinel(req) || payload.password !== password || Object.keys(payload).length !== 1) {
       return sendJson(res, 401, { error: { message: "invalid password" } });
     }
     if (selectedEmail === "setup-totp@example.com") return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
     return sendJson(res, 200, mfaPayload());
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
+    emailOtpValidateCount += 1;
     const payload = parseJson(body);
     if (payload.code !== "123456" || Object.keys(payload).length !== 1) {
       return sendJson(res, 400, { error: { message: "invalid email code" } });
