@@ -1,4 +1,4 @@
-# toSub2 批量提交账号 API
+# toSub2 账号 API
 
 Base URL：`http://127.0.0.1:4399`（可用 `--host`、`--port` 或环境变量修改）
 
@@ -146,6 +146,132 @@ email@example.com----密码----2FA密钥----编码后的请求体
 | 400 | 代理协议或格式错误 | `{"error":"账号代理必须是完整的 http://、https://、socks5:// 或 socks5h:// 地址"}` |
 | 400 | 代理协议不支持 | `{"error":"账号代理只支持 http、https、socks5 和 socks5h 协议"}` |
 | 500 | 文件、凭据存储等内部异常 | `{"error":"..."}` |
+
+---
+
+## POST /api/sub2api/relogin
+
+完整重新登录指定邮箱，授权完成后更新一个 Sub2API 账号。接口复用现有外部访问密钥；控制台账号行中的“重新登录并更新 Sub2API”调用同一接口。
+
+### 请求体
+
+```json
+{
+  "email": "user@example.com",
+  "sub2apiAccountId": 123
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `email` | string | 是 | 去除首尾空格并统一小写，定位本地最新的同邮箱任务；账号必须已在 toSub2 中登记 |
+| `sub2apiAccountId` | number | 否 | 正安全整数，不接受数字字符串；传入时直接绑定该远端账号，不再发查询请求 |
+
+必须先在 toSub2 保存 Sub2API 后端地址和管理员 API Key，但不必开启全局巡检。该操作跳过刷新令牌，不要求远端账号异常，也不受全局巡检号池、时间窗口和冷却限制。
+
+未传远端 ID 时，只调用一次服务端筛选查询，不遍历账号列表：
+
+```http
+GET /api/v1/admin/accounts?search=<email>&platform=openai&type=oauth&page=1&page_size=1&sort_by=created_at&sort_order=desc
+```
+
+`search` 的匹配语义是“账号名称包含邮箱”，不是精确查询 `credentials.email`。匹配多个账号时，取创建时间倒序的第一条；未找到本地或远端账号时，不启动登录。一次操作只更新绑定的远端 ID，不更新同邮箱的其他记录。
+
+### 接受任务 202
+
+```json
+{
+  "accountExists": true,
+  "started": true,
+  "email": "user@example.com",
+  "jobId": "本地任务 ID",
+  "status": "queued",
+  "prompt": "排队中，前方还有 0 条任务",
+  "queuePosition": 1,
+  "requiresInput": false,
+  "inputType": null,
+  "attempt": 2,
+  "manualInputAutoRetryCount": 0,
+  "operation": {
+    "id": "本轮操作 ID",
+    "sub2apiAccountId": 123,
+    "phase": "authorizing",
+    "error": null,
+    "startedAt": "2026-11-23T08:00:00.000Z",
+    "completedAt": null,
+    "updateStatus": "pending"
+  }
+}
+```
+
+`started=true` 只表示任务已接受并入队，不能据此判定登录或远端更新成功；应轮询下方状态接口。排队后可能很快启动，返回的 `status` 以实际快照为准。
+
+授权成功后调用 Sub2API 的 `apply-oauth-credentials`，提交新凭据，并局部更新 `extra.codex_fingerprint_mode` 为全局巡检配置中的值，保留其他自定义 `extra`。随后显式清除错误并恢复调度，全部成功后才标记操作完成。Sub2API 会校验 OAuth 身份，错误的远端 ID 不会被当作新账号创建。
+
+授权成功而更新失败时，`status` 可以为 `completed`，但 `operation.phase` 为 `failed`、`operation.updateStatus` 为 `failed`。启用全局巡检后，现有待重传机制会使用相同目标和回写方式重传，不重复登录；未启用巡检时，不新增后台重传定时器。
+
+### 业务失败
+
+业务错误响应包含 `started:false`、`code`、`error` 以及能够确定的账号／任务快照；未通过鉴权时沿用现有鉴权错误响应。
+
+| 状态码 | code | 场景 |
+|---|---|---|
+| 400 | `INVALID_EMAIL` | 邮箱缺失或格式错误 |
+| 400 | `INVALID_SUB2API_ACCOUNT_ID` | 远端 ID 不是正安全整数 |
+| 400 | `INVALID_REQUEST` | 请求体无效 |
+| 404 | `ACCOUNT_NOT_FOUND` | 本地没有该邮箱账号，`accountExists=false` |
+| 404 | `SUB2API_ACCOUNT_NOT_FOUND` | 邮箱筛选未找到远端账号 |
+| 409 | `ACCOUNT_BUSY` | 同邮箱已在排队、登录、等待输入或远端回写；返回当前状态，不重复启动 |
+| 409 | `SUB2API_NOT_CONFIGURED` | 尚未保存可用的 Sub2API 后端配置 |
+| 409 | `SERVICE_SHUTTING_DOWN` | 服务正在关闭 |
+| 502 | `SUB2API_REQUEST_FAILED` | 远端查询失败 |
+| 504 | `SUB2API_REQUEST_TIMEOUT` | 远端查询超时 |
+| 500 | `RELOGIN_START_FAILED` | 启动任务时发生内部错误 |
+
+---
+
+## GET /api/sub2api/relogin/status?email=...
+
+按邮箱查询当前本地登录状态及最近一次单账号更新操作，鉴权与启动接口相同：
+
+```http
+GET /api/sub2api/relogin/status?email=user%40example.com
+x-api-key: <访问密钥>
+```
+
+成功返回 `200`，字段与启动成功的快照相同，但不包含 `started`。没有执行过单账号更新的账号也可查询当前登录状态，此时 `operation=null`。本地账号不存在返回 `404`、`code=ACCOUNT_NOT_FOUND` 和 `accountExists=false`；邮箱无效返回 `400`、`code=INVALID_EMAIL`。
+
+| 字段 | 说明 |
+|---|---|
+| `status`、`prompt` | 原生任务状态与当前步骤提示 |
+| `queuePosition` | 排队位置，非排队时为 0 |
+| `requiresInput`、`inputType` | 是否正在等待人工输入，以及具体输入类型；自动收码运行中不视为需要人工输入 |
+| `attempt`、`manualInputAutoRetryCount` | 授权尝试次数、本轮因人工输入触发的自动重试次数 |
+| `operation.id`、`operation.sub2apiAccountId` | 最近一轮单账号操作标识及绑定的远端账号 |
+| `operation.phase` | `authorizing`、`updating`、`completed`、`failed`、`canceled` |
+| `operation.updateStatus` | `not_started`、`pending`、`updating`、`succeeded`、`failed`，独立于本地登录状态 |
+| `operation.error`、`operation.startedAt`、`operation.completedAt` | 本轮错误与开始／结束时间 |
+
+原生状态包括 `registered`（已登记）、`queued`（排队）、`starting`／`working`（登录中）、`password`／`email_otp`／`mfa_otp`／`phone`／`phone_otp`（对应输入阶段）、`finalizing`（生成文件）、`completed`、`failed`、`canceled`、`reauth_required`、`resume_available` 等。查询也可反映账号当前正在进行的独立 2FA、添加密码或令牌刷新流程，保留其原生状态。
+
+所有完整登录入口在首次确认需要人工输入时，会立即自动重新登录一次。自动填密码、TOTP、邮箱或短信收码仍在运行时不会触发重试；重试后仍需输入时，可在控制台现有输入框完成操作，沿用 `INPUT_WAIT_TIMEOUT_MS`，默认等待三分钟，超时取消并释放并发。独立设置 2FA、添加密码流程不套用这次自动重登规则。
+
+状态查询只返回必要的任务和操作信息，不返回密码、授权令牌、邮件 API 地址或 TOTP 密钥。操作元数据会持久化，服务重启后不会继续显示无法恢复的虚假进行中状态。
+
+### 调用与轮询示例
+
+```bash
+curl -s -X POST http://127.0.0.1:4399/api/sub2api/relogin \
+  -H 'content-type: application/json' \
+  -H "x-api-key: $API_KEY" \
+  -d '{"email":"user@example.com","sub2apiAccountId":123}'
+
+curl -s -G http://127.0.0.1:4399/api/sub2api/relogin/status \
+  -H "x-api-key: $API_KEY" \
+  --data-urlencode 'email=user@example.com'
+```
+
+以 `operation.phase=completed` 且 `operation.updateStatus=succeeded` 判定整轮操作成功；`status=completed` 本身只表示本地授权完成。
 
 ---
 

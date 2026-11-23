@@ -78,7 +78,9 @@ try {
   assert.equal(new Set(payloads.map((payload) => payload.job.id)).size, 1);
 
   const jobId = payloads[0].job.id;
-  await waitForJob(headers, jobId, (job) => job.status === "email_otp");
+  // No per-account mailbox body exists yet, so the first manual prompt restarts once.
+  const initialJob = await waitForJob(headers, jobId, (job) => job.status === "email_otp" && job.manualInputAutoRetryCount === 1 && job.attempt === 2);
+  assert.equal(initialJob.attempt, 2);
   const updateResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -88,13 +90,13 @@ try {
     }),
   });
   assert.equal(updateResponse.status, 200, await updateResponse.text());
-  await waitForJob(headers, jobId, (job) => job.attempt === 2 && job.status === "email_otp");
+  await waitForJob(headers, jobId, (job) => job.attempt === initialJob.attempt + 1 && job.status === "email_otp");
   await waitFor(() => latestMailboxRequest?.body === '{"mailbox_id":"same-email-mailbox"}');
   assert.equal(latestMailboxRequest.method, "POST");
   assert.equal(latestMailboxRequest.authorization, "Bearer mailbox-test-token");
 
   const logsAfterRestart = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
-  assert.equal(countOccurrences(logsAfterRestart.logs, "Mock queued login started"), 2);
+  assert.equal(countOccurrences(logsAfterRestart.logs, "Mock queued login started"), initialJob.attempt + 1);
 
   const unchangedResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -107,7 +109,7 @@ try {
   assert.equal(unchangedResponse.status, 200, await unchangedResponse.text());
   await delay(300);
   const unchangedLogs = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
-  assert.equal(countOccurrences(unchangedLogs.logs, "Mock queued login started"), 2);
+  assert.equal(countOccurrences(unchangedLogs.logs, "Mock queued login started"), initialJob.attempt + 1);
 
   const page = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(page.pagination.total, 1);
@@ -122,17 +124,21 @@ try {
   })));
   assert.equal(reloginResponses.filter((response) => response.status === 200).length, 1);
   assert.equal(reloginResponses.filter((response) => response.status === 409).length, 1);
-  const reloginJob = await waitForJob(headers, jobId, (job) => job.attempt === 3 && job.status === "email_otp");
-  assert.equal(reloginJob.attempt, 3, "concurrent relogin requests must increment the attempt only once");
+  const reloginJob = await waitForJob(headers, jobId, (job) => job.attempt === initialJob.attempt + 2 && job.status === "email_otp");
+  assert.equal(reloginJob.attempt, initialJob.attempt + 2, "concurrent relogin requests must increment the attempt only once");
   const logsAfterConcurrentRelogin = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
-  assert.equal(countOccurrences(logsAfterConcurrentRelogin.logs, "Mock queued login started"), 3);
+  assert.equal(countOccurrences(logsAfterConcurrentRelogin.logs, "Mock queued login started"), initialJob.attempt + 2);
 
-  // 等待人工输入超时后自动取消，释放并发且不影响自动修复资格
-  const timedOutJob = await waitForJob(headers, jobId, (job) => job.status === "canceled");
-  assert.match(timedOutJob.lastError || "", /等待输入超过/);
-  assert.equal(timedOutJob.autoRepairEligible, reloginJob.autoRepairEligible);
-  assert.equal(timedOutJob.autoRepairEligibilityReason, reloginJob.autoRepairEligibilityReason);
-  assert.equal(timedOutJob.autoRepairBlocked, false);
+  // 自动收码轮询期间不应被人工输入超时取消；显式取消后仍保留自动修复资格。
+  await delay(5_500);
+  const pollingJob = await waitForJob(headers, jobId, (job) => job.status === "email_otp");
+  assert.equal(pollingJob.attempt, reloginJob.attempt);
+  const finalCancelResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/cancel`, { method: "POST", headers, body: "{}" });
+  assert.equal(finalCancelResponse.status, 200, await finalCancelResponse.text());
+  const canceledJob = await waitForJob(headers, jobId, (job) => job.status === "canceled");
+  assert.equal(canceledJob.autoRepairEligible, reloginJob.autoRepairEligible);
+  assert.equal(canceledJob.autoRepairEligibilityReason, reloginJob.autoRepairEligibilityReason);
+  assert.equal(canceledJob.autoRepairBlocked, false);
   console.log("console job lock tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${consoleLogs}`;

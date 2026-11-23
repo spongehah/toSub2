@@ -643,6 +643,12 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if ((req.method === "POST" && requestUrl.pathname === "/api/sub2api/relogin")
+    || (req.method === "GET" && requestUrl.pathname === "/api/sub2api/relogin/status")) {
+    await handleSub2ApiReloginRequest(req, res, requestUrl);
+    return;
+  }
+
   if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor") {
     sendJson(res, 200, publicSub2ApiMonitorState());
     return;
@@ -902,6 +908,9 @@ async function startJob(email, credentials = {}, proxyUrl = null, { registerOnly
     autoRepairLastError: null,
     autoRepairPendingAccountIds: [],
     autoRepairPendingBackend: null,
+    autoRepairPendingMode: null,
+    sub2apiRelogin: null,
+    manualInputAutoRetryCount: 0,
     autoRepairOperation: null,
     ...newSmsState(),
   };
@@ -1165,10 +1174,12 @@ async function retryJob(job, options = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   job.mailCandidateCounts.clear();
+  job.manualInputAutoRetryCount = 0;
   clearAutoRepairBlock(job);
   job.autoRepairOperation = null;
   job.autoRepairPendingAccountIds = [];
   job.autoRepairPendingBackend = null;
+  job.autoRepairPendingMode = null;
   beginAuthorizationAutomationAttempt(job, "manual_retry");
   recordJobOperation(job, resumingCheckpoint ? "resume" : "reauthorize");
   appendJobLog(
@@ -1209,11 +1220,14 @@ async function regenerateJob(job, options = {}) {
 }
 
 async function forceReloginJob(job, options = {}, context = {}) {
-  if (!canForceRelogin(job)) {
+  const inputRetry = Boolean(context.preserveManualInputAutoRetry);
+  if (inputRetry && (job.runId !== context.inputRetryRunId || !canRestartForManualInput(job, true))) return false;
+  if (!canForceRelogin(job) && !inputRetry) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   await reloadMissingJobCredentials(job);
-  if (!canForceRelogin(job)) {
+  if (inputRetry && (job.runId !== context.inputRetryRunId || !canRestartForManualInput(job, true))) return false;
+  if (!canForceRelogin(job) && !inputRetry) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
@@ -1249,11 +1263,13 @@ async function forceReloginJob(job, options = {}, context = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   job.mailCandidateCounts.clear();
+  if (!inputRetry) job.manualInputAutoRetryCount = 0;
   job.attempt += 1;
   if (!context.autoRepair) {
     clearAutoRepairBlock(job);
     job.autoRepairPendingAccountIds = [];
     job.autoRepairPendingBackend = null;
+    job.autoRepairPendingMode = null;
   }
   job.autoRepairOperation = context.autoRepair || null;
   if (context.autoRepair) {
@@ -1262,13 +1278,17 @@ async function forceReloginJob(job, options = {}, context = {}) {
     job.autoRepairPendingAccountIds = [...new Set(context.autoRepair.accountIds || [])];
     job.autoRepairPendingBackend = context.autoRepair.backend || null;
   }
-  beginAuthorizationAutomationAttempt(job, context.autoRepair ? "sub2api_monitor" : "manual_relogin");
+  const autoRepairSource = context.autoRepair?.source === "single_relogin"
+    ? "sub2api_single_relogin"
+    : context.autoRepair ? "sub2api_monitor" : "manual_relogin";
+  beginAuthorizationAutomationAttempt(job, autoRepairSource);
   recordJobOperation(job, context.autoRepair ? "automatic_relogin" : "relogin");
   appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
   if (job.hasTotpCredential && !job.totpSecret) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
   }
   enqueueJob(job, "full", "正在强制重新登录并完成授权");
+  return true;
 }
 
 async function reloadMissingJobCredentials(job) {
@@ -1591,6 +1611,7 @@ async function fallbackFromRefresh(job) {
   job.parserTail = "";
   job.currentPhone = null;
   job.phoneError = null;
+  job.manualInputAutoRetryCount = 0;
   beginAuthorizationAutomationAttempt(job, "refresh_fallback");
   appendJobLog(job, "[refresh] 刷新令牌已失效，自动回退到邮箱验证码登录。\n");
   job.fallbackInProgress = false;
@@ -2200,6 +2221,9 @@ async function acquireSmsNumber(job, providerId, config) {
     }
     if (error?.status) throw error;
     throw httpError(502, safeSmsProviderError(error, smsClient.apiKey));
+  } finally {
+    // A failed automatic number acquisition leaves the job at the same input stage, so re-evaluate the manual-input policy.
+    if (job.runMode === "full" && job.status === "phone" && job.child) armInputWaitTimeout(job);
   }
 }
 
@@ -2277,6 +2301,7 @@ async function beginSmsPolling(job) {
     if (job.smsPollToken === pollToken) {
       job.smsPollToken = null;
       touch(job);
+      if (job.runMode === "full" && job.status === "phone_otp" && job.child) armInputWaitTimeout(job);
     }
   }
 }
@@ -2511,6 +2536,7 @@ async function cancelJob(job) {
   job.prompt = "流程已取消";
   job.child?.kill("SIGTERM");
   job.child = null;
+  await finishSub2ApiAutoRepairFailure(job);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
   scheduleQueuedJobs();
@@ -3162,10 +3188,11 @@ async function retryPendingSub2ApiUploads(config, summary) {
         || isAutoRepairCoolingDown(job)
       ) return;
 
-      const accounts = [];
+      const singleRelogin = job.autoRepairPendingMode === "single_relogin";
+      const accounts = singleRelogin ? pendingIds.map((id) => ({ id })) : [];
       const missingIds = [];
       try {
-        for (const accountId of pendingIds) {
+        for (const accountId of singleRelogin ? [] : pendingIds) {
           const account = await getSub2ApiAccount(config, accountId);
           if (account) accounts.push(account);
           else missingIds.push(accountId);
@@ -3193,6 +3220,10 @@ async function retryPendingSub2ApiUploads(config, summary) {
       }
 
       job.autoRepairOperation = createSub2ApiAutoRepairOperation(config, accounts);
+      if (singleRelogin) {
+        job.autoRepairOperation.source = "single_relogin";
+        job.autoRepairOperation.reloginOperationId = job.sub2apiRelogin?.id;
+      }
       job.autoRepairLastAttemptAt = new Date().toISOString();
       appendJobLog(job, `[monitor] 正在重传 ${accounts.length} 条上次未完成的 Sub2API 更新，不重复登录。\n`);
       if (await finishSub2ApiAutoRepairSuccess(job)) summary.updated += accounts.length;
@@ -3280,6 +3311,151 @@ function isRecentModelRateLimitedAccount(account, config) {
   if (!Number.isFinite(createdAt)) return false;
   const ageMs = Date.now() - createdAt;
   return ageMs >= 0 && ageMs <= config.rateLimitMinutes * 60_000;
+}
+
+function sub2ApiReloginError(status, code, message) {
+  return Object.assign(httpError(status, message), { reloginCode: code });
+}
+
+function publicReloginError(job, message) {
+  let text = String(message || "");
+  for (const secret of [job?.password, job?.totpSecret, job?.mailApiUrl, job?.mailRequestBody, mailRequestConfig.url, consoleApiKey, sub2ApiMonitorConfig?.adminApiKey]) {
+    if (secret) text = text.split(String(secret)).join("[redacted]");
+  }
+  return text.replace(/((?:["']?(?:access_token|refresh_token|id_token|authorization)["']?)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,}]+)/gi, "$1[redacted]").slice(0, 1000);
+}
+
+function publicSub2ApiReloginOperation(job) {
+  const operation = job.sub2apiRelogin;
+  if (!operation) return null;
+  let { phase, error, completedAt, updateStatus } = operation;
+  // 登录异常退出可能先清除修复上下文；状态查询仍须准确结束这一轮操作。
+  if (phase === "authorizing" && isTerminalStatus(job.status) && !job.autoRepairOperation) {
+    phase = job.status === "canceled" ? "canceled" : "failed";
+    error = job.lastError || "登录流程已中断，请重新发起授权";
+    completedAt ||= job.updatedAt;
+    updateStatus = "not_started";
+  }
+  return {
+    id: operation.id,
+    sub2apiAccountId: operation.sub2apiAccountId,
+    phase,
+    updateStatus,
+    error: error ? publicReloginError(job, error) : null,
+    startedAt: operation.startedAt,
+    completedAt: completedAt || null,
+  };
+}
+
+function sub2ApiReloginBusy(job) {
+  return !canForceRelogin(job) || Boolean(job.autoRepairOperation);
+}
+
+function publicSub2ApiReloginStatus(email, job) {
+  if (!job) return { accountExists: false, email, jobId: null, operation: null };
+  const requiresInput = INPUT_WAIT_STATUSES.has(job.status) && !isAwaitingAutomaticInput(job);
+  return {
+    accountExists: true,
+    email: job.email,
+    jobId: job.id,
+    status: job.status,
+    prompt: publicReloginError(job, job.status === "queued" ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务` : job.prompt),
+    queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
+    requiresInput,
+    inputType: requiresInput ? job.status : null,
+    lastError: job.lastError ? publicReloginError(job, job.lastError) : null,
+    attempt: job.attempt,
+    manualInputAutoRetryCount: job.manualInputAutoRetryCount || 0,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt || null,
+    operation: publicSub2ApiReloginOperation(job),
+  };
+}
+
+async function handleSub2ApiReloginRequest(req, res, requestUrl) {
+  let email = "";
+  let job = null;
+  const starting = req.method === "POST";
+  try {
+    const body = starting ? await readJson(req) : null;
+    const rawEmail = starting ? body?.email : requestUrl.searchParams.get("email");
+    email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+    if (!isEmail(email)) throw sub2ApiReloginError(400, "INVALID_EMAIL", "请提供有效的 email");
+    job = findJobByEmail(email);
+    const providedId = starting && Object.hasOwn(body, "sub2apiAccountId");
+    if (providedId && (!Number.isSafeInteger(body.sub2apiAccountId) || body.sub2apiAccountId <= 0)) {
+      throw sub2ApiReloginError(400, "INVALID_SUB2API_ACCOUNT_ID", "sub2apiAccountId 必须为正安全整数");
+    }
+    if (!job) throw sub2ApiReloginError(404, "ACCOUNT_NOT_FOUND", "本系统未找到该邮箱的账号资料");
+    if (!starting) {
+      sendJson(res, 200, publicSub2ApiReloginStatus(email, job));
+      return;
+    }
+    if (sub2ApiReloginBusy(job)) throw sub2ApiReloginError(409, "ACCOUNT_BUSY", "该账号已有排队、登录或远端更新任务");
+    await withEmailJobLock(email, async () => {
+      job = findJobByEmail(email);
+      if (!job || job.deleted) throw sub2ApiReloginError(404, "ACCOUNT_NOT_FOUND", "本系统未找到该邮箱的账号资料");
+      if (sub2ApiReloginBusy(job)) throw sub2ApiReloginError(409, "ACCOUNT_BUSY", "该账号已有排队、登录或远端更新任务");
+      if (!sub2ApiMonitorConfig?.baseUrl || !sub2ApiMonitorConfig?.adminApiKey) {
+        throw sub2ApiReloginError(409, "SUB2API_NOT_CONFIGURED", "请先配置 Sub2API 后端地址与管理员 API Key");
+      }
+      if (shuttingDown) throw sub2ApiReloginError(409, "SERVICE_SHUTTING_DOWN", "服务正在关闭，请稍后重试");
+      const config = { ...sub2ApiMonitorConfig };
+      const accountId = providedId ? body.sub2apiAccountId : (await findSub2ApiAccountByEmail(config, email))?.id;
+      if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+        throw sub2ApiReloginError(404, "SUB2API_ACCOUNT_NOT_FOUND", "Sub2API 中未找到名称包含该邮箱的 OpenAI OAuth 账号");
+      }
+      // 显式 ID 不读取远端快照；OAuth 专用接口负责校验身份并保留远端配置。
+      const operation = createSub2ApiAutoRepairOperation(config, [{ id: accountId }]);
+      operation.source = "single_relogin";
+      job.sub2apiRelogin = {
+        id: crypto.randomUUID(),
+        sub2apiAccountId: accountId,
+        phase: "authorizing",
+        updateStatus: "pending",
+        error: null,
+        startedAt: new Date().toISOString(),
+        completedAt: null,
+      };
+      operation.reloginOperationId = job.sub2apiRelogin.id;
+      job.autoRepairPendingMode = "single_relogin";
+      clearAutoRepairBlock(job);
+      await forceReloginJob(job, {}, { autoRepair: operation });
+      appendJobLog(job, `[sub2api] 已启动单账号重新登录，授权后仅更新远端账号 ${accountId}。\n`);
+      await saveJobMetadata(job);
+      sendJson(res, 202, { ...publicSub2ApiReloginStatus(email, job), started: true });
+    });
+  } catch (error) {
+    const status = error?.status || 500;
+    const code = error?.reloginCode || (status === 504 ? "SUB2API_REQUEST_TIMEOUT" : status === 502 ? "SUB2API_REQUEST_FAILED" : status === 400 || status === 413 ? "INVALID_REQUEST" : "RELOGIN_START_FAILED");
+    const message = error?.remoteStatus ? `Sub2API 返回 HTTP ${error.remoteStatus}` : error?.message || "请求失败";
+    sendJson(res, status, {
+      ...publicSub2ApiReloginStatus(email, job?.deleted ? null : job),
+      ...(starting ? { started: false } : {}),
+      code,
+      error: publicReloginError(job, message),
+    });
+  }
+}
+
+async function findSub2ApiAccountByEmail(config, email) {
+  const query = new URLSearchParams({
+    search: email,
+    platform: "openai",
+    type: "oauth",
+    page: "1",
+    page_size: "1",
+    sort_by: "created_at",
+    sort_order: "desc",
+  });
+  const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const account = (Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [])[0];
+  if (!account) return null;
+  const id = Number(account.id);
+  if (!Number.isSafeInteger(id) || id <= 0) throw httpError(502, "Sub2API 查询返回了无效账号 ID");
+  return { id };
 }
 
 function sub2ApiAccountEmail(account) {
@@ -3388,12 +3564,47 @@ async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccou
   return true;
 }
 
+async function applySub2ApiOAuthCredentials(config, accountId, localAccount) {
+  const payload = await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/apply-oauth-credentials`, {
+    method: "POST",
+    body: JSON.stringify({
+      type: "oauth",
+      credentials: localAccount.credentials,
+      extra: { codex_fingerprint_mode: config.codexFingerprintMode },
+    }),
+  });
+  // 专用接口的 extra 更新失败只记日志；核对回包，避免误报指纹已同步。
+  const updated = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  if (updated?.extra?.codex_fingerprint_mode !== config.codexFingerprintMode) {
+    throw new Error("Sub2API 未确认 Codex 指纹模式已更新");
+  }
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, { method: "POST", body: "{}" });
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+    method: "POST",
+    body: JSON.stringify({ schedulable: true }),
+  });
+  return true;
+}
+
+function setSingleReloginUpdateState(job, operation, phase, updateStatus, error = null) {
+  if (operation.source !== "single_relogin" || job.sub2apiRelogin?.id !== operation.reloginOperationId) return;
+  Object.assign(job.sub2apiRelogin, {
+    phase,
+    updateStatus,
+    error,
+    completedAt: ["completed", "failed", "canceled"].includes(phase) ? new Date().toISOString() : null,
+  });
+}
+
 async function performSub2ApiAutoRepairSuccess(job) {
   const operation = job.autoRepairOperation;
   if (!operation) return false;
   job.autoRepairPendingAccountIds = [...new Set(operation.accountIds)];
   job.autoRepairPendingBackend = operation.backend;
+  job.autoRepairPendingMode = operation.source === "single_relogin" ? "single_relogin" : null;
+  setSingleReloginUpdateState(job, operation, "updating", "updating");
   try {
+    await saveJobMetadata(job);
     const payload = await buildSub2ApiUploadPayload([job]);
     const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
       || payload.accounts[0];
@@ -3402,7 +3613,10 @@ async function performSub2ApiAutoRepairSuccess(job) {
     const pendingIds = new Set(job.autoRepairPendingAccountIds);
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
-      if (!(await updateSub2ApiAccountCredentials(operation.config, remoteAccount, localAccount))) continue;
+      const updated = operation.source === "single_relogin"
+        ? await applySub2ApiOAuthCredentials(operation.config, accountId, localAccount)
+        : await updateSub2ApiAccountCredentials(operation.config, remoteAccount, localAccount);
+      if (!updated) continue;
       pendingIds.delete(accountId);
       job.autoRepairPendingAccountIds = [...pendingIds];
     }
@@ -3411,7 +3625,9 @@ async function performSub2ApiAutoRepairSuccess(job) {
     job.autoRepairLastError = null;
     job.autoRepairPendingAccountIds = [];
     job.autoRepairPendingBackend = null;
+    job.autoRepairPendingMode = null;
     job.autoRepairOperation = null;
+    setSingleReloginUpdateState(job, operation, "completed", "succeeded");
     clearAutoRepairBlock(job);
     appendJobLog(job, `[monitor] 已用新授权覆盖更新 Sub2API 中的 ${operation.accountIds.length} 条账号记录。\n`);
     touch(job);
@@ -3419,8 +3635,11 @@ async function performSub2ApiAutoRepairSuccess(job) {
     return true;
   } catch (error) {
     job.autoRepairLastAttemptAt = new Date().toISOString();
-    job.autoRepairLastError = String(error?.message || error).slice(0, 500);
+    job.autoRepairLastError = operation.source === "single_relogin"
+      ? publicReloginError(job, error?.remoteStatus ? `Sub2API 返回 HTTP ${error.remoteStatus}` : error?.message || error)
+      : String(error?.message || error).slice(0, 500);
     job.autoRepairOperation = null;
+    setSingleReloginUpdateState(job, operation, "failed", "failed", job.autoRepairLastError);
     appendJobLog(job, `[monitor] 新授权已生成，但更新 Sub2API 失败：${job.autoRepairLastError}。下次巡检会优先重传，不会重复登录。\n`);
     touch(job);
     await saveJobMetadata(job);
@@ -3434,6 +3653,8 @@ async function finishSub2ApiAutoRepairFailure(job) {
   job.autoRepairOperation = null;
   job.autoRepairLastAttemptAt = new Date().toISOString();
   job.autoRepairLastError = job.autoRepairBlockedReason || job.lastError || "自动重新登录并授权未完成";
+  setSingleReloginUpdateState(job, operation, job.status === "canceled" ? "canceled" : "failed", "not_started", job.autoRepairLastError);
+  job.autoRepairPendingMode = null;
   appendJobLog(job, job.autoRepairBlocked
     ? "[monitor] 自动授权确认账号已永久不可用，已停止后续巡检。\n"
     : `[monitor] 本次自动授权未完成，${Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000))} 分钟内不会重复启动。\n`);
@@ -3547,6 +3768,9 @@ function publicJob(job) {
     autoRepairLastAttemptAt: job.autoRepairLastAttemptAt || null,
     autoRepairLastSuccessAt: job.autoRepairLastSuccessAt || null,
     autoRepairLastError: job.autoRepairLastError || null,
+    sub2apiRelogin: publicSub2ApiReloginOperation(job),
+    canReloginAndUpdateSub2Api: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey) && !sub2ApiReloginBusy(job),
+    manualInputAutoRetryCount: job.manualInputAutoRetryCount || 0,
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
@@ -3599,6 +3823,70 @@ function armInputWaitTimeout(job) {
   clearTimeout(job.inputWaitTimer);
   job.inputWaitTimer = null;
   if (!INPUT_WAIT_STATUSES.has(job.status)) return;
+
+  // 完整登录首次真正需要人工输入时，先安全地完整重登一次；自动收码期间不占用人工等待计时。
+  if (job.runMode === "full") {
+    if (isAwaitingAutomaticInput(job)) return;
+    if (!Number(job.manualInputAutoRetryCount || 0)) {
+      const { status, runId } = job;
+      job.inputWaitTimer = setTimeout(() => {
+        void withEmailJobLock(job.email, async () => {
+          if (job.status !== status || job.runId !== runId || !job.child) return;
+          if (isAwaitingAutomaticInput(job)) return;
+          job.manualInputAutoRetryCount = 1;
+          appendJobLog(job, `[input] 首次需要手动输入 ${status}，正在自动重新登录一次。\n`);
+          try {
+            const restarted = await forceReloginJob(job, {}, {
+              autoRepair: job.autoRepairOperation,
+              preserveManualInputAutoRetry: true,
+              inputRetryRunId: runId,
+            });
+            // 等待凭据期间若流程自行前进，不取消已经恢复的登录，也不消耗重试额度。
+            if (!restarted) {
+              job.manualInputAutoRetryCount = 0;
+              armInputWaitTimeout(job);
+              await saveJobMetadata(job);
+            }
+          } catch (error) {
+            await failManualInputAutoRetry(job, error);
+          }
+        }).catch(() => {});
+      }, 0);
+      job.inputWaitTimer.unref?.();
+      return;
+    }
+  }
+
+  scheduleInputWaitTimeout(job);
+}
+
+function isAwaitingAutomaticInput(job) {
+  return (job.status === "email_otp" && Boolean(job.mailPollRunning || job.mailPollToken))
+    || (job.status === "phone" && job.smsStatus === "requesting")
+    || (job.status === "phone_otp" && Boolean(job.smsPollToken));
+}
+
+function canRestartForManualInput(job, inputRetry) {
+  return inputRetry
+    && job.runMode === "full"
+    && INPUT_WAIT_STATUSES.has(job.status)
+    && Boolean(job.child)
+    && !isAwaitingAutomaticInput(job);
+}
+
+async function failManualInputAutoRetry(job, error) {
+  // Invalidate the old child before recording failure so its close handler cannot clear the repair context twice.
+  job.runId = crypto.randomUUID();
+  job.queueRunId = null;
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  failJob(job, `首次自动重新登录失败：${String(error?.message || error)}`);
+  await finishSub2ApiAutoRepairFailure(job);
+  await saveJobMetadata(job);
+  scheduleQueuedJobs();
+}
+
+function scheduleInputWaitTimeout(job) {
   const { status, runId } = job;
   job.inputWaitTimer = setTimeout(() => {
     void withEmailJobLock(job.email, async () => {
@@ -3621,6 +3909,7 @@ function failJob(job, message) {
   job.prompt = "流程失败";
   job.lastError = message;
   if (isPermanentAccountFailure(message)) markAutoRepairBlocked(job, message);
+  if (!job.child && job.autoRepairOperation) void finishSub2ApiAutoRepairFailure(job).catch(() => {});
   touch(job);
   void saveJobMetadata(job).catch(() => {});
 }
@@ -3818,6 +4107,24 @@ function downloadTimestamp(date = new Date()) {
 function setRestoredJob(id, job) {
   // 重新导入前再次确认墓碑，避免与删除操作交错时把任务复活
   if (deletedJobIds.has(id)) return;
+  const operation = job.sub2apiRelogin;
+  if (operation?.phase === "authorizing" && job.status === "queued") {
+    if (job.autoRepairPendingMode === "single_relogin" && sub2ApiMonitorConfig
+      && job.autoRepairPendingBackend === monitorBackendIdentity(sub2ApiMonitorConfig)) {
+      job.autoRepairOperation = createSub2ApiAutoRepairOperation(sub2ApiMonitorConfig, [{ id: operation.sub2apiAccountId }]);
+      job.autoRepairOperation.source = "single_relogin";
+      job.autoRepairOperation.reloginOperationId = operation.id;
+    } else {
+      job.status = "failed";
+      job.lastError = "服务重启后 Sub2API 后端配置不可用或已变更，请重新发起授权";
+    }
+  }
+  if (operation?.phase === "updating" || (operation?.phase === "authorizing" && isTerminalStatus(job.status))) {
+    operation.phase = job.status === "canceled" ? "canceled" : "failed";
+    operation.updateStatus = operation.updateStatus === "updating" ? "failed" : "not_started";
+    operation.error = job.lastError || "服务重启时操作尚未完成，远端更新可由后续巡检重传";
+    operation.completedAt = new Date().toISOString();
+  }
   jobs.set(id, job);
 }
 
@@ -4445,6 +4752,21 @@ function restoredProxyRiskState(metadata = {}) {
   };
 }
 
+function restoredSub2ApiReloginOperation(value) {
+  if (!value || typeof value.id !== "string" || !Number.isSafeInteger(value.sub2apiAccountId) || value.sub2apiAccountId <= 0) return null;
+  if (!["authorizing", "updating", "completed", "failed", "canceled"].includes(value.phase)) return null;
+  if (!["pending", "updating", "succeeded", "failed", "not_started"].includes(value.updateStatus)) return null;
+  return {
+    id: value.id,
+    sub2apiAccountId: value.sub2apiAccountId,
+    phase: value.phase,
+    updateStatus: value.updateStatus,
+    error: typeof value.error === "string" ? value.error : null,
+    startedAt: typeof value.startedAt === "string" ? value.startedAt : null,
+    completedAt: typeof value.completedAt === "string" ? value.completedAt : null,
+  };
+}
+
 function restoredAutoRepairState(metadata = {}) {
   const requirements = metadata.last_auth_requirements;
   const pendingIds = Array.isArray(metadata.auto_repair_pending_account_ids)
@@ -4471,6 +4793,9 @@ function restoredAutoRepairState(metadata = {}) {
     autoRepairLastError: metadata.auto_repair_last_error || null,
     autoRepairPendingAccountIds: [...new Set(pendingIds)],
     autoRepairPendingBackend: metadata.auto_repair_pending_backend || null,
+    autoRepairPendingMode: metadata.auto_repair_pending_mode === "single_relogin" ? "single_relogin" : null,
+    sub2apiRelogin: restoredSub2ApiReloginOperation(metadata.sub2api_relogin),
+    manualInputAutoRetryCount: Number(metadata.manual_input_auto_retry_count) >= 1 ? 1 : 0,
     autoRepairOperation: null,
   };
 }
@@ -4972,6 +5297,7 @@ function restartJobAfterConfigurationUpdate(job) {
   job.securityCheckRequired = false;
   job.restartRequired = false;
   job.attempt += 1;
+  job.manualInputAutoRetryCount = 0;
   beginAuthorizationAutomationAttempt(job, "configuration_update");
   appendJobLog(job, "[account] 已停止使用旧配置的登录进程，并使用新配置重新排队。\n");
   enqueueJob(job, "full", "账号资料已更新，正在重新建立登录会话");
@@ -5032,6 +5358,9 @@ async function saveJobMetadata(job) {
         auto_repair_last_error: job.autoRepairLastError || null,
         auto_repair_pending_account_ids: job.autoRepairPendingAccountIds || [],
         auto_repair_pending_backend: job.autoRepairPendingBackend || null,
+        auto_repair_pending_mode: job.autoRepairPendingMode || null,
+        sub2api_relogin: publicSub2ApiReloginOperation(job),
+        manual_input_auto_retry_count: job.manualInputAutoRetryCount || 0,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -5158,6 +5487,7 @@ async function beginMailPolling(job) {
       job.mailPollRunning = false;
       job.mailPollToken = null;
       touch(job);
+      if (job.runMode === "full" && job.status === "email_otp" && job.child) armInputWaitTimeout(job);
     }
   }
 }

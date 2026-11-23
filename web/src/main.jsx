@@ -269,7 +269,7 @@ function App() {
   }, [token, page, pageSize, emailFilter, searchQuery]);
 
   useEffect(() => {
-    if (!token || !features.sub2apiMonitor) return undefined;
+    if (!token) return undefined;
     let stopped = false;
     const load = async () => {
       try {
@@ -314,7 +314,7 @@ function App() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [token, features.sub2apiMonitor]);
+  }, [token]);
 
   useEffect(() => {
     if (!token) return;
@@ -1372,6 +1372,7 @@ function App() {
                     onUpload={() => uploadSelected([job.id])}
                     onSub2Update={() => updateSub2ApiSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2ApiKeyConfigured)}
+                    sub2apiReloginConfigured={Boolean(sub2apiMonitorStatus.configured && sub2apiMonitorStatus.adminApiKeyConfigured)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
@@ -2015,11 +2016,16 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelectionStart, onSelectionEnter, onSelectionClick, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onSub2Update, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelectionStart, onSelectionEnter, onSelectionClick, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onSub2Update, sub2apiUploadAvailable, sub2apiReloginConfigured, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [pendingRelogin, setPendingRelogin] = useState(null);
+  const reloginRequestRef = useRef(false);
 
   useEffect(() => setValue(""), [job.status]);
+  useEffect(() => {
+    if (pendingRelogin && job.sub2apiRelogin?.id === pendingRelogin.id) setPendingRelogin(null);
+  }, [pendingRelogin, job.sub2apiRelogin?.id]);
 
   async function sendInput(action, submittedValue = value) {
     setSubmitting(true);
@@ -2093,6 +2099,26 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
     }
   }
 
+  async function reloginAndUpdateSub2Api() {
+    // 请求成功后先使用返回的操作状态，避免列表轮询尚未同步时重复提交。
+    if (reloginRequestRef.current || reloginDisabledReason) return;
+    reloginRequestRef.current = true;
+    setSubmitting(true);
+    try {
+      const data = await apiFetch(token, "/api/sub2api/relogin", {
+        method: "POST",
+        body: JSON.stringify({ email: job.email }),
+      });
+      setPendingRelogin(data.operation);
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      reloginRequestRef.current = false;
+      setSubmitting(false);
+    }
+  }
+
   async function setupTotp() {
     setSubmitting(true);
     try {
@@ -2162,6 +2188,12 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
     }
   }
 
+  const sub2apiRelogin = pendingRelogin || job.sub2apiRelogin;
+  const reloginDisabledReason = !sub2apiReloginConfigured
+    ? "请先保存 Sub2API 后端地址和管理员 API Key，无需开启全局巡检"
+    : pendingRelogin || ["authorizing", "updating"].includes(sub2apiRelogin?.phase) || !job.canReloginAndUpdateSub2Api
+      ? "当前账号正在排队、登录或更新 Sub2API，请等待本轮操作结束"
+      : "";
   const inputConfig = getInputConfig(job.status, job.currentPhone);
   const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
@@ -2194,6 +2226,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
+        {sub2apiRelogin && (
+          <div className={sub2apiRelogin.phase === "failed" ? "row-error" : "prompt-line"}>
+            Sub2API：{formatSub2ApiRelogin(sub2apiRelogin)}
+          </div>
+        )}
         {job.autoRepairBlocked && (
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
@@ -2312,6 +2349,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
               {job.status === "registered" ? "登录并授权" : "重新登录并授权"}
             </button>
           )}
+          <button
+            type="button"
+            className="relogin-button"
+            onClick={reloginAndUpdateSub2Api}
+            disabled={submitting || Boolean(reloginDisabledReason)}
+            title={reloginDisabledReason || "完整重新登录并将新授权更新到 Sub2API 中最新匹配的账号"}
+          >
+            {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+            重新登录并更新 Sub2API
+          </button>
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
@@ -2395,6 +2442,15 @@ function StatusBadge({ status }) {
     registered: ["已登记", <FileText size={14} />],
   }[status] || [status, null];
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
+}
+
+function formatSub2ApiRelogin(operation) {
+  const target = operation.sub2apiAccountId ? `（账号 ${operation.sub2apiAccountId}）` : "";
+  if (operation.phase === "failed") return `操作失败${target}：${extractResponseMessage(operation.error || "请查看任务日志")}`;
+  if (operation.phase === "canceled") return `操作已取消${target}`;
+  if (operation.updateStatus === "succeeded") return `授权及远端更新均已完成${target}`;
+  if (operation.updateStatus === "updating") return `授权已完成，正在更新远端${target}`;
+  return `等待本轮登录授权完成后更新${target}`;
 }
 
 function RepairEligibilityBadge({ job }) {

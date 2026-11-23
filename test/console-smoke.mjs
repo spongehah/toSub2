@@ -410,7 +410,12 @@ try {
   const phoneFallbackText = await phoneFallbackResponse.text();
   assert.equal(phoneFallbackResponse.status, 201, phoneFallbackText);
   const phoneFallbackJobId = JSON.parse(phoneFallbackText).job.id;
-  await waitForJob(headers, phoneFallbackJobId, (value) => value.status === "phone");
+  // 完整登录首次遇到人工输入会重试一次，等待新一轮稳定进入手机号输入。
+  const phoneInputJob = await waitForJob(
+    headers,
+    phoneFallbackJobId,
+    (value) => value.status === "phone" && value.manualInputAutoRetryCount === 1,
+  );
   const firstPhoneInput = await fetch(`${baseUrl}/api/jobs/${phoneFallbackJobId}/input`, {
     method: "POST",
     headers,
@@ -422,7 +427,8 @@ try {
     phoneFallbackJobId,
     (value) => value.status === "phone" && /更换手机号/.test(value.prompt || ""),
   );
-  assert.equal(changePhoneJob.attempt, 1, "a phone-specific fallback error must not restart account login");
+  assert.equal(changePhoneJob.attempt, phoneInputJob.attempt, "a phone-specific fallback error must not restart account login again");
+  assert.equal(changePhoneJob.manualInputAutoRetryCount, phoneInputJob.manualInputAutoRetryCount);
   assert.equal(changePhoneJob.restartRequired, false);
   assert.match(changePhoneJob.phoneError || "", /手机号触发了风控/);
   const secondPhoneInput = await fetch(`${baseUrl}/api/jobs/${phoneFallbackJobId}/input`, {

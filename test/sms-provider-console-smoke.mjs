@@ -92,7 +92,7 @@ try {
   });
   assert.equal(createdResponse.status, 201);
   const created = await createdResponse.json();
-  await waitForJob(headers, created.job.id, (job) => job.status === "phone");
+  await waitForJob(headers, created.job.id, (job) => job.status === "phone" && job.manualInputAutoRetryCount === 1);
 
   const numberResponse = await fetch(`${baseUrl}/api/jobs/${created.job.id}/sms-number`, {
     method: "POST",
@@ -122,7 +122,7 @@ try {
   });
   assert.equal(rejectedResponse.status, 201);
   const rejected = await rejectedResponse.json();
-  await waitForJob(headers, rejected.job.id, (job) => job.status === "phone");
+  await waitForJob(headers, rejected.job.id, (job) => job.status === "phone" && job.manualInputAutoRetryCount === 1);
   const rejectedNumberResponse = await fetch(`${baseUrl}/api/jobs/${rejected.job.id}/sms-number`, {
     method: "POST",
     headers,
@@ -155,7 +155,7 @@ try {
   });
   assert.equal(customCreatedResponse.status, 201);
   const customCreated = await customCreatedResponse.json();
-  await waitForJob(headers, customCreated.job.id, (job) => job.status === "phone");
+  await waitForJob(headers, customCreated.job.id, (job) => job.status === "phone" && job.manualInputAutoRetryCount === 1);
   const customNumberResponse = await fetch(`${baseUrl}/api/jobs/${customCreated.job.id}/sms-number`, {
     method: "POST",
     headers,
