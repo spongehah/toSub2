@@ -158,14 +158,16 @@ email@example.com----密码----2FA密钥----编码后的请求体
 ```json
 {
   "email": "user@example.com",
-  "sub2apiAccountId": 123
+  "sub2apiAccountId": 123,
+  "restoreState": true
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `email` | string | 是 | 去除首尾空格并统一小写，定位本地最新的同邮箱任务；账号必须已在 toSub2 中登记 |
-| `sub2apiAccountId` | number | 否 | 正安全整数，不接受数字字符串；传入时直接绑定该远端账号，不再发查询请求 |
+| `sub2apiAccountId` | number | 否 | 正安全整数，不接受数字字符串；传入时直接绑定该远端账号，启动前不再按邮箱查询 |
+| `restoreState` | boolean | 否 | 默认 `true`，更新授权后清错并恢复调度；`false` 时仅更新凭据和指纹信息，保留远端状态、错误信息和调度开关 |
 
 必须先在 toSub2 保存 Sub2API 后端地址和管理员 API Key，但不必开启全局巡检。该操作跳过刷新令牌，不要求远端账号异常，也不受全局巡检号池、时间窗口和冷却限制。
 
@@ -195,6 +197,7 @@ GET /api/v1/admin/accounts?search=<email>&platform=openai&type=oauth&page=1&page
   "operation": {
     "id": "本轮操作 ID",
     "sub2apiAccountId": 123,
+    "restoreState": true,
     "phase": "authorizing",
     "error": null,
     "startedAt": "2026-11-23T08:00:00.000Z",
@@ -206,9 +209,11 @@ GET /api/v1/admin/accounts?search=<email>&platform=openai&type=oauth&page=1&page
 
 `started=true` 只表示任务已接受并入队，不能据此判定登录或远端更新成功；应轮询下方状态接口。排队后可能很快启动，返回的 `status` 以实际快照为准。
 
-授权成功后调用 Sub2API 的 `apply-oauth-credentials`，提交新凭据，并局部更新 `extra.codex_fingerprint_mode` 为全局巡检配置中的值，保留其他自定义 `extra`。随后显式清除错误并恢复调度，全部成功后才标记操作完成。Sub2API 会校验 OAuth 身份，错误的远端 ID 不会被当作新账号创建。
+`restoreState=true`（默认）时，授权成功后调用 Sub2API 的 `apply-oauth-credentials`，提交新凭据，并局部更新 `extra.codex_fingerprint_mode` 为全局巡检配置中的值，保留其他自定义 `extra`。随后显式清除错误并恢复调度，全部成功后才标记操作完成。此模式使用 Sub2API 的 OAuth 身份校验；传入远端 ID 时，无需先 GET 账号快照。
 
-授权成功而更新失败时，`status` 可以为 `completed`，但 `operation.phase` 为 `failed`、`operation.updateStatus` 为 `failed`。启用全局巡检后，现有待重传机制会使用相同目标和回写方式重传，不重复登录；未启用巡检时，不新增后台重传定时器。
+`restoreState=false` 时，授权成功后先 GET 目标账号的最新快照，确认目标为 OpenAI OAuth 账号且邮箱／稳定身份与本次授权匹配，再将远端原凭据与新凭据合并、保留原 `extra` 并覆盖指纹模式，通过普通 `PUT /accounts/{id}` 保存。目标类型不兼容或身份不匹配时停止回写，并通过状态接口返回本轮操作失败。此模式不调用 `apply-oauth-credentials`、`clear-error` 或 `schedulable`，不修改账号的 `status`、错误信息和调度开关；因此即使启动时已传 ID，回写前仍有一次用于校验身份及合并自定义配置的 GET。普通 PUT 不主动清除 Sub2API 的令牌缓存，已有缓存按 Sub2API 的缓存策略失效。两种模式都不会创建远端账号。
+
+授权成功而更新失败时，`status` 可以为 `completed`，但 `operation.phase` 为 `failed`、`operation.updateStatus` 为 `failed`。启用全局巡检后，现有待重传机制会使用相同目标、`restoreState` 和回写方式重传，不重复登录；未启用巡检时，不新增后台重传定时器。
 
 ### 业务失败
 
@@ -218,6 +223,7 @@ GET /api/v1/admin/accounts?search=<email>&platform=openai&type=oauth&page=1&page
 |---|---|---|
 | 400 | `INVALID_EMAIL` | 邮箱缺失或格式错误 |
 | 400 | `INVALID_SUB2API_ACCOUNT_ID` | 远端 ID 不是正安全整数 |
+| 400 | `INVALID_RESTORE_STATE` | `restoreState` 不是布尔值 |
 | 400 | `INVALID_REQUEST` | 请求体无效 |
 | 404 | `ACCOUNT_NOT_FOUND` | 本地没有该邮箱账号，`accountExists=false` |
 | 404 | `SUB2API_ACCOUNT_NOT_FOUND` | 邮箱筛选未找到远端账号 |
@@ -248,6 +254,7 @@ x-api-key: <访问密钥>
 | `requiresInput`、`inputType` | 是否正在等待人工输入，以及具体输入类型；自动收码运行中不视为需要人工输入 |
 | `attempt`、`manualInputAutoRetryCount` | 授权尝试次数、本轮因人工输入触发的自动重试次数 |
 | `operation.id`、`operation.sub2apiAccountId` | 最近一轮单账号操作标识及绑定的远端账号 |
+| `operation.restoreState` | 本轮是否恢复远端状态，默认 `true`；持久化并在人工输入重试、待重传时沿用 |
 | `operation.phase` | `authorizing`、`updating`、`completed`、`failed`、`canceled` |
 | `operation.updateStatus` | `not_started`、`pending`、`updating`、`succeeded`、`failed`，独立于本地登录状态 |
 | `operation.error`、`operation.startedAt`、`operation.completedAt` | 本轮错误与开始／结束时间 |
@@ -264,14 +271,14 @@ x-api-key: <访问密钥>
 curl -s -X POST http://127.0.0.1:4399/api/sub2api/relogin \
   -H 'content-type: application/json' \
   -H "x-api-key: $API_KEY" \
-  -d '{"email":"user@example.com","sub2apiAccountId":123}'
+  -d '{"email":"user@example.com","sub2apiAccountId":123,"restoreState":true}'
 
 curl -s -G http://127.0.0.1:4399/api/sub2api/relogin/status \
   -H "x-api-key: $API_KEY" \
   --data-urlencode 'email=user@example.com'
 ```
 
-以 `operation.phase=completed` 且 `operation.updateStatus=succeeded` 判定整轮操作成功；`status=completed` 本身只表示本地授权完成。
+以 `operation.phase=completed` 且 `operation.updateStatus=succeeded` 判定整轮操作成功；`status=completed` 本身只表示本地授权完成。`restoreState=false` 的成功仅代表授权及凭据／指纹更新完成，不代表账号已被恢复为可调度状态。
 
 ---
 

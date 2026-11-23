@@ -14,6 +14,7 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const requests = [];
 const remoteAccounts = new Map();
 const failClearOnce = new Set();
+const failPutOnce = new Set();
 let releaseApply = null;
 let blockedApplyId = null;
 let child;
@@ -21,15 +22,17 @@ let childExit;
 let logs = "";
 let apiKey = "";
 
-for (const [id, email] of [[101, "explicit@example.com"], [202, "search@example.com"], [201, "search@example.com"], [303, "resend@example.com"], [404, "mfa-prompt@example.com"], [505, "queued@example.com"]]) {
+for (const [id, email] of [[101, "explicit@example.com"], [202, "search@example.com"], [201, "search@example.com"], [303, "resend@example.com"], [404, "mfa-prompt@example.com"], [505, "queued@example.com"], [606, "info-error@example.com"], [607, "info-inactive@example.com"], [608, "info-resend@example.com"], [609, "info-search@example.com"]]) {
   remoteAccounts.set(id, {
     id,
     name: `oauth---${email}`,
     platform: "openai",
     type: "oauth",
     created_at: id === 201 ? "2026-01-01T00:00:00Z" : "2026-11-23T00:00:00Z",
-    status: "error",
-    credentials: { email, chatgpt_account_id: `test-account-${email}` },
+    status: id === 607 ? "inactive" : "error",
+    schedulable: false,
+    error_message: "original remote error",
+    credentials: { email, chatgpt_account_id: `test-account-${email}`, custom_credential: "preserve-credential" },
     extra: { custom_setting: "preserve-me", codex_fingerprint_mode: "device" },
   });
 }
@@ -50,6 +53,17 @@ const sub2api = http.createServer(async (req, res) => {
         .filter((account) => account.name.includes(email))
         .sort((a, b) => b.created_at.localeCompare(a.created_at)) : [];
       return send(res, 200, { data: { items, total: items.length, page: 1, page_size: 1, pages: 1 } });
+    }
+    const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(url.pathname);
+    if (detailMatch && ["GET", "PUT"].includes(req.method)) {
+      const id = Number(detailMatch[1]);
+      const account = remoteAccounts.get(id);
+      if (!account) return send(res, 404, { message: "remote account not found" });
+      if (req.method === "PUT") {
+        if (failPutOnce.delete(id)) return send(res, 500, { message: "simulated information update failure" });
+        Object.assign(account, body);
+      }
+      return send(res, 200, { data: account });
     }
     const match = /^\/api\/v1\/admin\/accounts\/(\d+)\/(apply-oauth-credentials|clear-error|schedulable)$/.exec(url.pathname);
     if (req.method !== "POST" || !match) return send(res, 404, { message: "unexpected remote request" });
@@ -127,6 +141,12 @@ try {
   };
   const configured = await api("/api/sub2api/monitor", "POST", { enabled: false, config });
   assert.equal(configured.status, 200, JSON.stringify(configured.body));
+  for (const restoreState of [null, "false", 0, 1, {}, []]) {
+    const invalidRestoreState = await api("/api/sub2api/relogin", "POST", { email: explicit.email, sub2apiAccountId: 101, restoreState });
+    assert.equal(invalidRestoreState.status, 400, JSON.stringify(invalidRestoreState.body));
+    assert.equal(invalidRestoreState.body.code, "INVALID_RESTORE_STATE");
+    assert.equal(invalidRestoreState.body.started, false);
+  }
 
   // A supplied target never requires either account-list or account-detail lookup.
   blockedApplyId = 101;
@@ -135,6 +155,7 @@ try {
   assert.equal(explicitStart.body.started, true);
   assert.equal(explicitStart.body.email, explicit.email);
   assert.equal(explicitStart.body.operation.sub2apiAccountId, 101);
+  assert.equal(explicitStart.body.operation.restoreState, true, "state recovery remains the default");
   const updating = await waitForStatus(explicit.email, (value) => value.operation?.updateStatus === "updating");
   assert.equal(updating.status, "completed", "login completion must be distinct from remote update completion");
   assert.equal(updating.operation.phase, "updating");
@@ -150,6 +171,7 @@ try {
   assert.equal(completed.operation.phase, "completed");
   assert.equal(completed.operation.id, explicitStart.body.operation.id);
   assert.equal(completed.operation.sub2apiAccountId, 101);
+  assert.equal(completed.operation.restoreState, true);
   assert.equal(completed.operation.error, null);
   assert.equal(typeof completed.operation.completedAt, "string");
   assertSafeStatus(completed);
@@ -238,6 +260,74 @@ try {
   assert.equal(entered.status, 200, JSON.stringify(entered.body));
   await waitForStatus("mfa-prompt@example.com", (value) => value.operation?.updateStatus === "succeeded");
 
+  // Information-only updates must never activate accounts or change their scheduling switch.
+  for (const [id, email] of [[606, "info-error@example.com"], [607, "info-inactive@example.com"]]) {
+    await createCompleted(email);
+    const original = structuredClone(remoteAccounts.get(id));
+    requests.length = 0;
+    const informationStart = await api("/api/sub2api/relogin", "POST", { email, sub2apiAccountId: id, restoreState: false });
+    assert.equal(informationStart.status, 202, JSON.stringify(informationStart.body));
+    assert.equal(informationStart.body.operation.restoreState, false);
+    const informationDone = await waitForStatus(email, (value) => value.operation?.updateStatus === "succeeded");
+    assert.equal(informationDone.operation.restoreState, false);
+    assert.equal(informationDone.operation.phase, "completed");
+    const remote = remoteAccounts.get(id);
+    assert.equal(remote.status, original.status);
+    assert.equal(remote.schedulable, false);
+    assert.equal(remote.error_message, original.error_message);
+    assert.equal(remote.credentials.custom_credential, "preserve-credential");
+    assert.equal(remote.credentials.access_token, `test-access-${email}`);
+    assert.deepEqual(remote.extra, { custom_setting: "preserve-me", codex_fingerprint_mode: "full" });
+    assert.deepEqual(requests.map((request) => [request.method, request.pathname]), [
+      ["GET", `/api/v1/admin/accounts/${id}`],
+      ["PUT", `/api/v1/admin/accounts/${id}`],
+    ]);
+    assert.deepEqual(Object.keys(requests[1].body).sort(), ["credentials", "extra"]);
+    assert.equal(requests[1].body.credentials.custom_credential, "preserve-credential");
+    assert.equal(requests[1].body.extra.custom_setting, "preserve-me");
+  }
+
+  // A supplied ID belonging to another email must not overwrite that account's credentials.
+  await createCompleted("wrong-target@example.com");
+  const wrongTargetBefore = structuredClone(remoteAccounts.get(606));
+  requests.length = 0;
+  const wrongTarget = await api("/api/sub2api/relogin", "POST", { email: "wrong-target@example.com", sub2apiAccountId: 606, restoreState: false });
+  assert.equal(wrongTarget.status, 202, JSON.stringify(wrongTarget.body));
+  const wrongTargetFailed = await waitForStatus("wrong-target@example.com", (value) => value.operation?.updateStatus === "failed");
+  assert.equal(wrongTargetFailed.status, "completed");
+  assert.equal(wrongTargetFailed.operation.phase, "failed");
+  assert.equal(wrongTargetFailed.operation.restoreState, false);
+  assert.deepEqual(requests.map((request) => [request.method, request.pathname]), [["GET", "/api/v1/admin/accounts/606"]]);
+  assert.deepEqual(remoteAccounts.get(606), wrongTargetBefore);
+
+  // Omitting the target ID keeps the same server-filtered lookup for information-only updates.
+  await createCompleted("info-search@example.com");
+  requests.length = 0;
+  const informationSearch = await api("/api/sub2api/relogin", "POST", { email: "info-search@example.com", restoreState: false });
+  assert.equal(informationSearch.status, 202, JSON.stringify(informationSearch.body));
+  assert.equal(informationSearch.body.operation.sub2apiAccountId, 609);
+  assert.equal(informationSearch.body.operation.restoreState, false);
+  await waitForStatus("info-search@example.com", (value) => value.operation?.updateStatus === "succeeded");
+  assert.equal(requests[0].method, "GET");
+  assert.equal(requests[0].query.search, "info-search@example.com");
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
+  assert.equal(requests.some((request) => request.method === "POST"), false);
+  assert.equal(remoteAccounts.get(609).status, "error");
+  assert.equal(remoteAccounts.get(609).schedulable, false);
+  assert.equal(remoteAccounts.get(609).error_message, "original remote error");
+
+  // Failed information-only writes retain the selected behavior across restart and pending resend.
+  await createCompleted("info-resend@example.com");
+  failPutOnce.add(608);
+  const informationResend = await api("/api/sub2api/relogin", "POST", { email: "info-resend@example.com", sub2apiAccountId: 608, restoreState: false });
+  assert.equal(informationResend.status, 202);
+  const informationFailed = await waitForStatus("info-resend@example.com", (value) => value.operation?.updateStatus === "failed");
+  assert.equal(informationFailed.status, "completed");
+  assert.equal(informationFailed.operation.restoreState, false);
+  assert.equal(informationFailed.operation.phase, "failed");
+  const informationAttempt = informationFailed.attempt;
+  const informationOperationId = informationFailed.operation.id;
+
   // A failed remote cleanup survives restart and later retries only the remote update.
   await createCompleted("resend@example.com");
   failClearOnce.add(303);
@@ -255,6 +345,11 @@ try {
   assert.equal(restored.operation.id, operationId);
   assert.equal(restored.operation.phase, "failed");
   assert.equal(restored.operation.updateStatus, "failed");
+  assert.equal(restored.operation.restoreState, true);
+  const informationRestored = (await status("info-resend@example.com")).body;
+  assert.equal(informationRestored.operation.id, informationOperationId);
+  assert.equal(informationRestored.operation.restoreState, false);
+  assert.equal(informationRestored.operation.updateStatus, "failed");
   requests.length = 0;
   const enabled = await api("/api/sub2api/monitor", "POST", { enabled: true, config });
   assert.equal(enabled.status, 200);
@@ -264,9 +359,24 @@ try {
   assert.equal(resent.attempt, attempt, "pending remote resend must not rerun login");
   assert.equal(resent.operation.id, operationId);
   assert.equal(resent.operation.sub2apiAccountId, 303);
-  assert.equal(requests.some((request) => request.method === "PUT"), false);
+  assert.equal(requests.some((request) => request.method === "PUT" && request.pathname === "/api/v1/admin/accounts/303"), false);
   assert.equal(requests.some((request) => request.pathname === "/api/v1/admin/accounts/303"), false);
   assert.equal(requests.filter((request) => request.pathname === "/api/v1/admin/accounts/303/apply-oauth-credentials").length, 1);
+  const informationResent = await waitForStatus("info-resend@example.com", (value) => value.operation?.updateStatus === "succeeded");
+  assert.equal(informationResent.attempt, informationAttempt, "information resend must not rerun login");
+  assert.equal(informationResent.operation.id, informationOperationId);
+  assert.equal(informationResent.operation.restoreState, false);
+  assert.equal(informationResent.operation.sub2apiAccountId, 608);
+  const informationRequests = requests.filter((request) => request.pathname.startsWith("/api/v1/admin/accounts/608"));
+  assert.deepEqual(informationRequests.map((request) => [request.method, request.pathname]), [
+    ["GET", "/api/v1/admin/accounts/608"],
+    ["PUT", "/api/v1/admin/accounts/608"],
+  ]);
+  assert.equal(remoteAccounts.get(608).status, "error");
+  assert.equal(remoteAccounts.get(608).schedulable, false);
+  assert.equal(remoteAccounts.get(608).error_message, "original remote error");
+  assert.equal(remoteAccounts.get(608).credentials.custom_credential, "preserve-credential");
+  assert.deepEqual(remoteAccounts.get(608).extra, { custom_setting: "preserve-me", codex_fingerprint_mode: "full" });
   console.log("console sub2api relogin tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${logs}`;

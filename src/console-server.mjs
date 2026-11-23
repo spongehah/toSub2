@@ -3223,6 +3223,7 @@ async function retryPendingSub2ApiUploads(config, summary) {
       if (singleRelogin) {
         job.autoRepairOperation.source = "single_relogin";
         job.autoRepairOperation.reloginOperationId = job.sub2apiRelogin?.id;
+        job.autoRepairOperation.restoreState = job.sub2apiRelogin?.restoreState !== false;
       }
       job.autoRepairLastAttemptAt = new Date().toISOString();
       appendJobLog(job, `[monitor] 正在重传 ${accounts.length} 条上次未完成的 Sub2API 更新，不重复登录。\n`);
@@ -3339,6 +3340,7 @@ function publicSub2ApiReloginOperation(job) {
   return {
     id: operation.id,
     sub2apiAccountId: operation.sub2apiAccountId,
+    restoreState: operation.restoreState !== false,
     phase,
     updateStatus,
     error: error ? publicReloginError(job, error) : null,
@@ -3387,6 +3389,9 @@ async function handleSub2ApiReloginRequest(req, res, requestUrl) {
     if (providedId && (!Number.isSafeInteger(body.sub2apiAccountId) || body.sub2apiAccountId <= 0)) {
       throw sub2ApiReloginError(400, "INVALID_SUB2API_ACCOUNT_ID", "sub2apiAccountId 必须为正安全整数");
     }
+    if (starting && Object.hasOwn(body, "restoreState") && typeof body.restoreState !== "boolean") {
+      throw sub2ApiReloginError(400, "INVALID_RESTORE_STATE", "restoreState 必须为布尔值");
+    }
     if (!job) throw sub2ApiReloginError(404, "ACCOUNT_NOT_FOUND", "本系统未找到该邮箱的账号资料");
     if (!starting) {
       sendJson(res, 200, publicSub2ApiReloginStatus(email, job));
@@ -3406,12 +3411,14 @@ async function handleSub2ApiReloginRequest(req, res, requestUrl) {
       if (!Number.isSafeInteger(accountId) || accountId <= 0) {
         throw sub2ApiReloginError(404, "SUB2API_ACCOUNT_NOT_FOUND", "Sub2API 中未找到名称包含该邮箱的 OpenAI OAuth 账号");
       }
-      // 显式 ID 不读取远端快照；OAuth 专用接口负责校验身份并保留远端配置。
+      // 显式 ID 不在启动时查询；仅更新信息模式在回写前读取远端快照进行合并。
       const operation = createSub2ApiAutoRepairOperation(config, [{ id: accountId }]);
       operation.source = "single_relogin";
+      operation.restoreState = body.restoreState !== false;
       job.sub2apiRelogin = {
         id: crypto.randomUUID(),
         sub2apiAccountId: accountId,
+        restoreState: operation.restoreState,
         phase: "authorizing",
         updateStatus: "pending",
         error: null,
@@ -3537,7 +3544,7 @@ function finishSub2ApiAutoRepairSuccess(job) {
   return operationPromise;
 }
 
-async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccount) {
+async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccount, restoreState = true) {
   const accountId = Number(remoteAccount?.id);
   if (!Number.isSafeInteger(accountId) || accountId <= 0) return false;
   // 与号池巡检保持一致：远端已有配置为基础，仅覆盖本地新凭据和 Codex 指纹模式
@@ -3553,6 +3560,7 @@ async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccou
     method: "PUT",
     body: JSON.stringify({ credentials, extra }),
   });
+  if (!restoreState) return true;
   await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
     method: "POST",
     body: "{}",
@@ -3564,12 +3572,34 @@ async function updateSub2ApiAccountCredentials(config, remoteAccount, localAccou
   return true;
 }
 
-async function applySub2ApiOAuthCredentials(config, accountId, localAccount) {
+async function applySub2ApiOAuthCredentials(config, accountId, localAccount, restoreState = true) {
+  // 导出文件把 user ID 放在 extra；OAuth 管理接口使用 credentials 中的同一身份字段。
+  const credentials = { ...localAccount.credentials };
+  const userId = String(credentials.chatgpt_user_id || localAccount.extra?.chatgpt_user_id || "").trim();
+  if (userId) credentials.chatgpt_user_id = userId;
+  if (!restoreState) {
+    const remoteAccount = await getSub2ApiAccount(config, accountId);
+    if (!remoteAccount) throw new Error(`Sub2API 账号 ${accountId} 已不存在`);
+    if (remoteAccount.platform !== "openai" || remoteAccount.type !== "oauth") {
+      throw new Error("仅更新信息模式要求目标是 OpenAI OAuth 账号");
+    }
+    const remoteUserId = String(remoteAccount.credentials?.chatgpt_user_id || remoteAccount.extra?.chatgpt_user_id || "").trim();
+    const remoteEmail = sub2ApiAccountEmail(remoteAccount);
+    const localEmail = sub2ApiAccountEmail(localAccount);
+    if ((remoteUserId && userId && remoteUserId !== userId)
+      || (remoteEmail && localEmail && remoteEmail !== localEmail)
+      || (!(remoteUserId && userId) && !(remoteEmail && localEmail))) {
+      throw new Error("新授权身份与目标 Sub2API 账号不匹配，未更新账号信息");
+    }
+    // 不调用专用 OAuth 应用、清错或调度接口，避免它们恢复账号状态。
+    credentials._token_version = Date.now();
+    return updateSub2ApiAccountCredentials(config, remoteAccount, { ...localAccount, credentials }, false);
+  }
   const payload = await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/apply-oauth-credentials`, {
     method: "POST",
     body: JSON.stringify({
       type: "oauth",
-      credentials: localAccount.credentials,
+      credentials,
       extra: { codex_fingerprint_mode: config.codexFingerprintMode },
     }),
   });
@@ -3614,7 +3644,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
       const updated = operation.source === "single_relogin"
-        ? await applySub2ApiOAuthCredentials(operation.config, accountId, localAccount)
+        ? await applySub2ApiOAuthCredentials(operation.config, accountId, localAccount, operation.restoreState !== false)
         : await updateSub2ApiAccountCredentials(operation.config, remoteAccount, localAccount);
       if (!updated) continue;
       pendingIds.delete(accountId);
@@ -4114,6 +4144,7 @@ function setRestoredJob(id, job) {
       job.autoRepairOperation = createSub2ApiAutoRepairOperation(sub2ApiMonitorConfig, [{ id: operation.sub2apiAccountId }]);
       job.autoRepairOperation.source = "single_relogin";
       job.autoRepairOperation.reloginOperationId = operation.id;
+      job.autoRepairOperation.restoreState = operation.restoreState !== false;
     } else {
       job.status = "failed";
       job.lastError = "服务重启后 Sub2API 后端配置不可用或已变更，请重新发起授权";
@@ -4759,6 +4790,7 @@ function restoredSub2ApiReloginOperation(value) {
   return {
     id: value.id,
     sub2apiAccountId: value.sub2apiAccountId,
+    restoreState: value.restoreState !== false,
     phase: value.phase,
     updateStatus: value.updateStatus,
     error: typeof value.error === "string" ? value.error : null,

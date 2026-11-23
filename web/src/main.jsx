@@ -2107,7 +2107,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
     try {
       const data = await apiFetch(token, "/api/sub2api/relogin", {
         method: "POST",
-        body: JSON.stringify({ email: job.email }),
+        body: JSON.stringify({ email: job.email, restoreState: true }),
       });
       setPendingRelogin(data.operation);
       onError("");
