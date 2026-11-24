@@ -279,7 +279,7 @@ try {
 async function writeCompleted(outputPath, email, tokenPrefix = "test") {
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   const account = {
-    name: `oauth---${email}`,
+    name: email,
     platform: "openai",
     type: "oauth",
     credentials: {

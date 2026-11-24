@@ -2007,7 +2007,7 @@ function decodeJwtPayload(jwt) {
 }
 
 function buildAccountName(email) {
-  return email ? `oauth---${email}` : `oauth---${new Date().toISOString()}`;
+  return email || new Date().toISOString();
 }
 
 function pickWorkspaceId(payload) {
@@ -2382,7 +2382,7 @@ Options:
   --refresh-sub2api <file>        Refresh an existing sub2api OAuth file without email login.
   --checkpoint <file>             Save resumable login state after email verification.
   --resume-checkpoint <file>      Resume a saved login state before requesting a new email code.
-  --sub2api-name <name>           Account name in sub2api. Default: oauth---<email>
+  --sub2api-name <name>           Account name in sub2api. Default: <email>
   --concurrency <number>          sub2api concurrency. Default: 10
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
