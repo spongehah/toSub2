@@ -2357,7 +2357,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onSelec
             title={reloginDisabledReason || "完整重新登录并将新授权更新到 Sub2API 中最新匹配的账号"}
           >
             {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-            重新登录并更新 Sub2API
+            巡检
           </button>
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
