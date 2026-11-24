@@ -354,7 +354,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .account-search-clear:hover { color: var(--ink); }
 
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
-table { width: 100%; min-width: 1740px; border-collapse: collapse; table-layout: fixed; }
+table { width: 100%; min-width: 1200px; border-collapse: collapse; table-layout: fixed; }
 th {
   height: 42px;
   padding: 0 16px;
@@ -367,13 +367,14 @@ th {
   text-transform: uppercase;
   letter-spacing: 0;
 }
-th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 17%; }
-th:nth-child(3) { width: 9%; }
-th:nth-child(4) { width: 23%; }
-th:nth-child(5) { width: 8%; }
-th:nth-child(6) { width: 11%; }
-th:nth-child(7) { width: 28%; }
+/* Bound short columns to their content; let the current step use the remaining width. */
+th:nth-child(1) { width: 44px; }
+th:nth-child(2) { width: clamp(220px, 20vw, 300px); }
+th:nth-child(3) { width: 132px; }
+th:nth-child(4) { width: auto; }
+th:nth-child(5) { width: clamp(88px, 7vw, 112px); }
+th:nth-child(6) { width: clamp(112px, 9vw, 144px); }
+th:nth-child(7) { width: clamp(300px, 30vw, 560px); }
 .actions-heading { text-align: right; }
 .select-heading, .select-cell { text-align: center; }
 .select-heading input, .select-cell input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); cursor: pointer; }
