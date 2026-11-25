@@ -300,6 +300,7 @@ function App() {
                   rateLimitModels: data.rateLimitModels,
                   rateLimitMinutes: data.rateLimitMinutes,
                   planMonitorWindows: data.planMonitorWindows,
+                  planMonitorWindowSchedules: data.planMonitorWindowSchedules,
                   codexFingerprintMode: data.codexFingerprintMode,
                 })
               : current;
@@ -1812,6 +1813,18 @@ function App() {
                   spellCheck="false"
                 />
               </label>
+              <label className="settings-field wide-settings-field">
+                <span>按时段覆盖巡检窗口（小时，可选）</span>
+                <textarea
+                  className="sub2api-model-textarea"
+                  value={sub2apiSettingsDraft.planMonitorWindowSchedules}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, planMonitorWindowSchedules: event.target.value }))}
+                  placeholder={"每行 plan_type@HH:MM-HH:MM=小时（1 到 8760），留空沿用固定窗口\n例如：\ndefault@08:00-22:00=6\ndefault@22:00-08:00=24"}
+                  rows="4"
+                  spellCheck="false"
+                />
+                <small>时区：北京时间（Asia/Shanghai）。按每轮巡检开始时间选择窗口，支持跨午夜；包含开始时间，不包含结束时间。同一 plan_type 的时段不能重叠。优先级：对应类型时段 → 对应类型固定窗口 → default 时段 → default 固定窗口 → 不限制。</small>
+              </label>
             </div>
             <div className="dialog-hint">配置保存在服务端，其他设备打开后会自动同步；管理员 API Key 保存后不再回显，留空保存会沿用服务端已保存的 Key。分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
@@ -2800,6 +2813,7 @@ function normalizeSub2ApiSettings(value) {
     rateLimitModels: Array.isArray(stored.rateLimitModels) ? stored.rateLimitModels.join("\n") : String(stored.rateLimitModels || ""),
     rateLimitMinutes: String(stored.rateLimitMinutes ?? ""),
     planMonitorWindows: formatPlanMonitorWindowsSetting(stored.planMonitorWindows),
+    planMonitorWindowSchedules: formatPlanMonitorWindowSchedulesSetting(stored.planMonitorWindowSchedules),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",
@@ -2810,6 +2824,11 @@ function normalizeSub2ApiSettings(value) {
 function formatPlanMonitorWindowsSetting(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return String(value || "");
   return Object.entries(value).map(([planType, hours]) => `${planType}=${hours}`).join("\n");
+}
+
+function formatPlanMonitorWindowSchedulesSetting(value) {
+  if (!Array.isArray(value)) return String(value || "");
+  return value.map(({ planType, start, end, hours }) => `${planType}@${start}-${end}=${hours}`).join("\n");
 }
 
 function readSub2ApiSettings(value) {

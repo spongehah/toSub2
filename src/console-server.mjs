@@ -2676,11 +2676,12 @@ function normalizeSub2ApiConfig(value) {
     throw httpError(400, "填写限流模型后请设置新账号限流判定窗口（分钟）");
   }
   const planMonitorWindows = parseSub2ApiPlanMonitorWindows(config.planMonitorWindows);
+  const planMonitorWindowSchedules = parseSub2ApiPlanMonitorWindowSchedules(config.planMonitorWindowSchedules);
   const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, planMonitorWindows, codexFingerprintMode };
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, planMonitorWindows, planMonitorWindowSchedules, codexFingerprintMode };
 }
 
 function resolveSub2ApiConfig(value) {
@@ -2721,7 +2722,11 @@ function parseSub2ApiModelWhitelist(value) {
 function parseSub2ApiPlanMonitorWindows(value) {
   // 每行一个 plan_type=小时，default 表示未匹配 plan_type 时的默认窗口；留空表示不限制创建时间
   const windows = Object.create(null);
-  const lines = String(value || "")
+  // 持久化及 API 回传使用对象，网页输入使用文本，两种格式统一校验。
+  const text = value && typeof value === "object" && !Array.isArray(value)
+    ? Object.entries(value).map(([planType, hours]) => `${planType}=${hours}`).join("\n")
+    : String(value || "");
+  const lines = text
     .split(/[\r\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
@@ -2736,6 +2741,63 @@ function parseSub2ApiPlanMonitorWindows(value) {
     windows[match[1].toLowerCase()] = hours;
   }
   return windows;
+}
+
+function parseSub2ApiPlanMonitorWindowSchedules(value) {
+  // 文本用于设置界面，结构化列表用于 API 与持久化；跨午夜区间拆成两段检查重叠。
+  if (value != null && typeof value !== "string" && !Array.isArray(value)) {
+    throw httpError(400, "巡检时段覆盖必须是文本或规则列表");
+  }
+  const entries = Array.isArray(value) ? value : String(value || "").split(/[\r\n]+/).map((line) => line.trim()).filter(Boolean);
+  if (entries.length > 100) throw httpError(400, "巡检时段覆盖最多填写 100 条");
+  const rangesByPlan = new Map();
+  return entries.map((entry) => {
+    let rule = entry;
+    if (typeof entry === "string") {
+      const match = /^([a-z0-9_-]{1,64})\s*@\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*=\s*(\d{1,5})$/i.exec(entry);
+      if (!match) throw httpError(400, `巡检时段格式不正确：${entry.slice(0, 80)}，请写成 plan_type@HH:MM-HH:MM=小时`);
+      rule = { planType: match[1], start: match[2], end: match[3], hours: Number(match[4]) };
+    }
+    const planType = String(rule?.planType || "").trim().toLowerCase();
+    const start = String(rule?.start || "").trim();
+    const end = String(rule?.end || "").trim();
+    const hours = rule?.hours;
+    if (!/^[a-z0-9_-]{1,64}$/.test(planType)) throw httpError(400, "巡检时段的 plan_type 格式不正确");
+    if (![start, end].every((time) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) || start === end) {
+      throw httpError(400, "巡检时段时间必须为 00:00 到 23:59，且开始与结束时间不能相同");
+    }
+    if (!Number.isSafeInteger(hours) || hours < 1 || hours > 8760) {
+      throw httpError(400, "巡检时段窗口小时数必须是 1 到 8760 之间的整数");
+    }
+    const startMinute = sub2ApiMonitorTimeMinutes(start);
+    const endMinute = sub2ApiMonitorTimeMinutes(end);
+    const ranges = startMinute < endMinute ? [[startMinute, endMinute]] : [[startMinute, 1440], [0, endMinute]];
+    const previous = rangesByPlan.get(planType) || [];
+    if (ranges.some(([from, to]) => previous.some(([otherFrom, otherTo]) => from < otherTo && otherFrom < to))) {
+      throw httpError(400, `${planType} 的巡检时段不能重叠`);
+    }
+    rangesByPlan.set(planType, [...previous, ...ranges]);
+    return { planType, start, end, hours };
+  });
+}
+
+function sub2ApiMonitorTimeMinutes(time) {
+  const [hours, minutes] = time.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
+function resolveSub2ApiPlanMonitorWindows(windows, schedules, now) {
+  if (!schedules?.length) return windows;
+  const time = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Shanghai", hourCycle: "h23", hour: "2-digit", minute: "2-digit" }).format(now);
+  const minute = sub2ApiMonitorTimeMinutes(time);
+  const effective = Object.assign(Object.create(null), windows);
+  for (const rule of schedules) {
+    const start = sub2ApiMonitorTimeMinutes(rule.start);
+    const end = sub2ApiMonitorTimeMinutes(rule.end);
+    const matches = start < end ? minute >= start && minute < end : minute >= start || minute < end;
+    if (matches) effective[rule.planType] = rule.hours;
+  }
+  return effective;
 }
 
 function requestSub2Api(config, endpoint, options = {}) {
@@ -2996,6 +3058,7 @@ async function persistSub2ApiMonitorConfiguration() {
       rateLimitModels: sub2ApiMonitorConfig.rateLimitModels,
       rateLimitMinutes: sub2ApiMonitorConfig.rateLimitMinutes,
       planMonitorWindows: sub2ApiMonitorConfig.planMonitorWindows,
+      planMonitorWindowSchedules: sub2ApiMonitorConfig.planMonitorWindowSchedules,
       codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
     },
     state: {
@@ -3025,6 +3088,7 @@ function publicSub2ApiMonitorState() {
     rateLimitModels: sub2ApiMonitorConfig?.rateLimitModels || [],
     rateLimitMinutes: sub2ApiMonitorConfig?.rateLimitMinutes ?? null,
     planMonitorWindows: sub2ApiMonitorConfig?.planMonitorWindows || {},
+    planMonitorWindowSchedules: sub2ApiMonitorConfig?.planMonitorWindowSchedules || [],
     codexFingerprintMode: sub2ApiMonitorConfig?.codexFingerprintMode || "session",
     intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
     cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
@@ -3060,6 +3124,9 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
   if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "Sub2API 号池监控未启用");
   if (sub2ApiMonitorPromise) return sub2ApiMonitorPromise;
   const config = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
+  // 一轮内统一使用开始时的北京时间和账号年龄，避免跨时段或远端分页导致窗口不一致。
+  const monitorNow = Date.now();
+  const planMonitorWindows = resolveSub2ApiPlanMonitorWindows(config.planMonitorWindows, config.planMonitorWindowSchedules, monitorNow);
   sub2ApiMonitorPromise = (async () => {
     sub2ApiMonitorState.running = true;
     sub2ApiMonitorState.lastError = null;
@@ -3090,7 +3157,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
           summary.outsideGroups += 1;
           continue;
         }
-        if (!isSub2ApiAccountInMonitorWindow(account, config.planMonitorWindows)) {
+        if (!isSub2ApiAccountInMonitorWindow(account, planMonitorWindows, monitorNow)) {
           summary.outsideWindow += 1;
           continue;
         }
@@ -3495,7 +3562,7 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
 }
 
-function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows) {
+function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows, now = Date.now()) {
   // 未配置窗口时保持原有巡检行为；配置后按 credentials.plan_type 选择小时数，未匹配时使用 default
   if (!planMonitorWindows || typeof planMonitorWindows !== "object") return true;
   const planType = String(account?.credentials?.plan_type || "").trim().toLowerCase();
@@ -3505,7 +3572,7 @@ function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows) {
   if (!Number.isFinite(hours) || hours <= 0) return true;
   const createdAt = Date.parse(String(account?.created_at || ""));
   if (!Number.isFinite(createdAt)) return false;
-  const ageMs = Date.now() - createdAt;
+  const ageMs = now - createdAt;
   return ageMs >= 0 && ageMs <= hours * 3_600_000;
 }
 
