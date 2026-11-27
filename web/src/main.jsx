@@ -298,7 +298,7 @@ function App() {
                   priority: data.priority,
                   modelWhitelist: data.modelWhitelist,
                   rateLimitModels: data.rateLimitModels,
-                  rateLimitMinutes: data.rateLimitMinutes,
+                  rateLimitEnabled: data.rateLimitEnabled,
                   planMonitorWindows: data.planMonitorWindows,
                   planMonitorWindowSchedules: data.planMonitorWindowSchedules,
                   codexFingerprintMode: data.codexFingerprintMode,
@@ -434,12 +434,6 @@ function App() {
     }
     if (!adminApiKey && !sub2apiMonitorStatus.adminApiKeyConfigured) {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
-      return;
-    }
-    const rateLimitMinutes = String(sub2apiSettingsDraft.rateLimitMinutes || "").trim();
-    if (String(sub2apiSettingsDraft.rateLimitModels || "").trim()
-      && (!/^\d+$/.test(rateLimitMinutes) || Number(rateLimitMinutes) < 1 || Number(rateLimitMinutes) > 10080)) {
-      setSub2apiSettingsError("请填写 1 到 10080 之间的新账号限流判定窗口（分钟）");
       return;
     }
     const planWindowLines = String(sub2apiSettingsDraft.planMonitorWindows || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -1790,17 +1784,16 @@ function App() {
                   spellCheck="false"
                 />
               </label>
-              <label className="settings-field">
-                <span>新账号限流判定窗口（分钟）</span>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
                 <input
-                  type="number"
-                  min="1"
-                  max="10080"
-                  step="1"
-                  value={sub2apiSettingsDraft.rateLimitMinutes}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, rateLimitMinutes: event.target.value }))}
-                  placeholder="例如 30"
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.rateLimitEnabled)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, rateLimitEnabled: event.target.checked }))}
                 />
+                <span>
+                  <strong>新账号限流检测</strong>
+                  <small>开启后，命中限流模型的新账号会重新登录；判定窗口沿用下方的巡检窗口</small>
+                </span>
               </label>
               <label className="settings-field wide-settings-field">
                 <span>按 plan_type 的巡检窗口（小时）</span>
@@ -1826,7 +1819,7 @@ function App() {
                 <small>时区：北京时间（Asia/Shanghai）。按每轮巡检开始时间选择窗口，支持跨午夜；包含开始时间，不包含结束时间。同一 plan_type 的时段不能重叠。优先级：对应类型时段 → 对应类型固定窗口 → default 时段 → default 固定窗口 → 不限制。</small>
               </label>
             </div>
-            <div className="dialog-hint">配置保存在服务端，其他设备打开后会自动同步；管理员 API Key 保存后不再回显，留空保存会沿用服务端已保存的 Key。分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；在判定窗口内命中模型限流会自动重新登录并更新授权。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口。</div>
+            <div className="dialog-hint">配置保存在服务端，其他设备打开后会自动同步；管理员 API Key 保存后不再回显，留空保存会沿用服务端已保存的 Key。分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。新账号刚录入时可能尚未读取到订阅计划，导致指定模型不可用；开启新账号限流检测后，命中模型限流的新账号会自动重新登录并更新授权，账号年龄窗口沿用巡检窗口。填写按 plan_type 的巡检窗口后，只巡检创建时间在窗口内的账号，未匹配的 plan_type 使用 default 窗口；未配置窗口时不限制账号创建时间。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -2811,7 +2804,9 @@ function normalizeSub2ApiSettings(value) {
     priority: String(stored.priority ?? ""),
     modelWhitelist: Array.isArray(stored.modelWhitelist) ? stored.modelWhitelist.join("\n") : String(stored.modelWhitelist || ""),
     rateLimitModels: Array.isArray(stored.rateLimitModels) ? stored.rateLimitModels.join("\n") : String(stored.rateLimitModels || ""),
-    rateLimitMinutes: String(stored.rateLimitMinutes ?? ""),
+    rateLimitEnabled: stored.rateLimitEnabled !== undefined && stored.rateLimitEnabled !== null
+      ? stored.rateLimitEnabled === true || stored.rateLimitEnabled === "true"
+      : Number(stored.rateLimitMinutes) > 0,
     planMonitorWindows: formatPlanMonitorWindowsSetting(stored.planMonitorWindows),
     planMonitorWindowSchedules: formatPlanMonitorWindowSchedulesSetting(stored.planMonitorWindowSchedules),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)

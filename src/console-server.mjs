@@ -2671,17 +2671,22 @@ function normalizeSub2ApiConfig(value) {
   const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
   const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
   const rateLimitModels = parseSub2ApiModelWhitelist(config.rateLimitModels);
-  const rateLimitMinutes = parseOptionalSub2ApiInteger(config.rateLimitMinutes, "新账号限流判定窗口", 1, 10080);
-  if (rateLimitModels.length && rateLimitMinutes === null) {
-    throw httpError(400, "填写限流模型后请设置新账号限流判定窗口（分钟）");
-  }
+  const rateLimitEnabled = parseSub2ApiRateLimitEnabled(config);
   const planMonitorWindows = parseSub2ApiPlanMonitorWindows(config.planMonitorWindows);
   const planMonitorWindowSchedules = parseSub2ApiPlanMonitorWindowSchedules(config.planMonitorWindowSchedules);
   const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitMinutes, planMonitorWindows, planMonitorWindowSchedules, codexFingerprintMode };
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, rateLimitModels, rateLimitEnabled, planMonitorWindows, planMonitorWindowSchedules, codexFingerprintMode };
+}
+
+function parseSub2ApiRateLimitEnabled(config) {
+  // 新配置使用显式开关；旧配置只保存了分钟窗口，有窗口即视为开启
+  if (config.rateLimitEnabled !== undefined && config.rateLimitEnabled !== null && config.rateLimitEnabled !== "") {
+    return config.rateLimitEnabled === true || config.rateLimitEnabled === "true";
+  }
+  return Number(config.rateLimitMinutes) > 0;
 }
 
 function resolveSub2ApiConfig(value) {
@@ -3056,7 +3061,7 @@ async function persistSub2ApiMonitorConfiguration() {
       priority: sub2ApiMonitorConfig.priority,
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
       rateLimitModels: sub2ApiMonitorConfig.rateLimitModels,
-      rateLimitMinutes: sub2ApiMonitorConfig.rateLimitMinutes,
+      rateLimitEnabled: sub2ApiMonitorConfig.rateLimitEnabled,
       planMonitorWindows: sub2ApiMonitorConfig.planMonitorWindows,
       planMonitorWindowSchedules: sub2ApiMonitorConfig.planMonitorWindowSchedules,
       codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
@@ -3086,7 +3091,7 @@ function publicSub2ApiMonitorState() {
     priority: sub2ApiMonitorConfig?.priority ?? null,
     modelWhitelist: sub2ApiMonitorConfig?.modelWhitelist || [],
     rateLimitModels: sub2ApiMonitorConfig?.rateLimitModels || [],
-    rateLimitMinutes: sub2ApiMonitorConfig?.rateLimitMinutes ?? null,
+    rateLimitEnabled: Boolean(sub2ApiMonitorConfig?.rateLimitEnabled),
     planMonitorWindows: sub2ApiMonitorConfig?.planMonitorWindows || {},
     planMonitorWindowSchedules: sub2ApiMonitorConfig?.planMonitorWindowSchedules || [],
     codexFingerprintMode: sub2ApiMonitorConfig?.codexFingerprintMode || "session",
@@ -3149,7 +3154,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       await syncCompletedOutputs(true);
       await retryPendingSub2ApiUploads(config, summary);
       if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
-      const remoteAccounts = await listSub2ApiMonitorAccounts(config);
+      const remoteAccounts = await listSub2ApiMonitorAccounts(config, planMonitorWindows, monitorNow);
       summary.checked = remoteAccounts.length;
       const grouped = new Map();
       for (const account of remoteAccounts) {
@@ -3357,28 +3362,25 @@ async function listSub2ApiErrorAccounts(config) {
   return accounts.filter((account) => String(account.status || "error") === "error");
 }
 
-async function listSub2ApiMonitorAccounts(config) {
-  // 配置了限流模型时拉取全部账号，供新账号模型受限判定使用；未配置时保持只拉取 error 账号
-  if (!config.rateLimitModels.length || config.rateLimitMinutes === null) {
+async function listSub2ApiMonitorAccounts(config, planMonitorWindows, now = Date.now()) {
+  // 开启限流检测并填写模型时拉取全部账号，供新账号模型受限判定使用；否则只拉取 error 账号
+  if (!config.rateLimitEnabled || !config.rateLimitModels.length) {
     return listSub2ApiErrorAccounts(config);
   }
   const accounts = await listSub2ApiAccounts(config);
   return accounts.filter((account) => (
     String(account.status || "").toLowerCase() === "error"
-    || isRecentModelRateLimitedAccount(account, config)
+    || isRecentModelRateLimitedAccount(account, config, planMonitorWindows, now)
   ));
 }
 
-function isRecentModelRateLimitedAccount(account, config) {
-  // 仅处理状态正常但刚录入的新账号：指定模型出现在 model_rate_limits 中，且账号创建时间在判定窗口内
-  if (String(account?.status || "").toLowerCase() !== "active") return false;
+function isRecentModelRateLimitedAccount(account, config, planMonitorWindows, now = Date.now()) {
+  // 仅处理状态正常的新账号：指定模型出现在 model_rate_limits 中，且账号年龄在巡检窗口内
+  if (!config.rateLimitEnabled || String(account?.status || "").toLowerCase() !== "active") return false;
   const modelRateLimits = account?.extra?.model_rate_limits;
   if (!modelRateLimits || typeof modelRateLimits !== "object" || Array.isArray(modelRateLimits)) return false;
   if (!config.rateLimitModels.some((model) => Object.prototype.hasOwnProperty.call(modelRateLimits, model))) return false;
-  const createdAt = Date.parse(String(account?.created_at || ""));
-  if (!Number.isFinite(createdAt)) return false;
-  const ageMs = Date.now() - createdAt;
-  return ageMs >= 0 && ageMs <= config.rateLimitMinutes * 60_000;
+  return isSub2ApiAccountInMonitorWindow(account, planMonitorWindows, now);
 }
 
 function sub2ApiReloginError(status, code, message) {
@@ -3562,14 +3564,20 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
 }
 
-function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows, now = Date.now()) {
-  // 未配置窗口时保持原有巡检行为；配置后按 credentials.plan_type 选择小时数，未匹配时使用 default
-  if (!planMonitorWindows || typeof planMonitorWindows !== "object") return true;
+function sub2ApiAccountMonitorWindowHours(account, planMonitorWindows) {
+  // 按 credentials.plan_type 选择小时数，未匹配时使用 default；null 表示不限制账号创建时间
+  if (!planMonitorWindows || typeof planMonitorWindows !== "object") return null;
   const planType = String(account?.credentials?.plan_type || "").trim().toLowerCase();
   const hours = planType && Object.prototype.hasOwnProperty.call(planMonitorWindows, planType)
     ? planMonitorWindows[planType]
     : planMonitorWindows.default;
-  if (!Number.isFinite(hours) || hours <= 0) return true;
+  return Number.isFinite(hours) && hours > 0 ? hours : null;
+}
+
+function isSub2ApiAccountInMonitorWindow(account, planMonitorWindows, now = Date.now()) {
+  // 未配置窗口时保持原有巡检行为；配置后只纳入创建时间在窗口内的账号
+  const hours = sub2ApiAccountMonitorWindowHours(account, planMonitorWindows);
+  if (hours === null) return true;
   const createdAt = Date.parse(String(account?.created_at || ""));
   if (!Number.isFinite(createdAt)) return false;
   const ageMs = now - createdAt;
